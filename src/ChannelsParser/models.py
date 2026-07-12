@@ -1,27 +1,52 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Literal
 
 
 AudienceBias = Literal["any", "female", "male"]
 AgeGroup = Literal["any", "14-17", "18-24", "25-34", "35+"]
+ChannelKind = Literal["any", "thematic", "commercial"]
 SortMode = Literal["score", "views", "subscribers", "fresh", "reactions", "comments"]
-ScanMode = Literal["search", "audit"]
+ScanMode = Literal["search", "audit", "discover"]
 ScanStatus = Literal["running", "done", "failed"]
 
 
 @dataclass(slots=True)
 class SearchFilters:
-    min_subscribers: int | None = 100
-    max_subscribers: int | None = 5000
+    min_subscribers: int | None = 1000
+    max_subscribers: int | None = 50000
     max_last_post_days: int = 7
     min_activity_score: float = 35.0
     min_avg_views: int | None = None
+    channel_kind: ChannelKind = "thematic"
     audience_bias: AudienceBias = "female"
     age_group: AgeGroup = "any"
     sort_by: SortMode = "score"
+
+
+@dataclass(slots=True)
+class DiscoveryOptions:
+    include_comment_links: bool = True
+    include_profile_refs: bool = True
+    include_gifts: bool = True
+    min_subscribers: int | None = None
+    max_subscribers: int | None = None
+
+
+def discovery_filters(base: SearchFilters, options: DiscoveryOptions | None = None) -> SearchFilters:
+    """Relax topic/demographic filters for commenter-profile discovery."""
+    options = options or DiscoveryOptions()
+    return replace(
+        base,
+        min_subscribers=options.min_subscribers,
+        max_subscribers=options.max_subscribers,
+        min_avg_views=None,
+        channel_kind="any",
+        audience_bias="any",
+        age_group="any",
+    )
 
 
 @dataclass(slots=True)
@@ -64,6 +89,8 @@ class ChannelReport:
     audience: AudienceEstimate
     matched_queries: list[str] = field(default_factory=list)
     collected_at: datetime | None = None
+    owner_username: str | None = None
+    owner_display_name: str | None = None
 
     @property
     def display_link(self) -> str:
@@ -73,6 +100,15 @@ class ChannelReport:
             return f"@{self.username}"
         return "private/public id only"
 
+    @property
+    def owner_label(self) -> str | None:
+        if self.owner_username:
+            label = f"@{self.owner_username}"
+            if self.owner_display_name:
+                return f"{label} ({self.owner_display_name})"
+            return label
+        return self.owner_display_name
+
 
 @dataclass(slots=True)
 class SearchRunResult:
@@ -81,6 +117,7 @@ class SearchRunResult:
     inspected_channels: int = 0
     skipped_channels: int = 0
     errors: list[str] = field(default_factory=list)
+    stats: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

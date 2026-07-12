@@ -6,6 +6,7 @@ import inspect
 from telethon import TelegramClient
 
 from ChannelsParser.config import AppSettings, ConfigError
+from ChannelsParser.proxy import telethon_proxy
 
 
 async def login() -> None:
@@ -18,6 +19,7 @@ async def login() -> None:
         settings.telegram_session,
         settings.telegram_api_id,
         settings.telegram_api_hash,
+        proxy=telethon_proxy(settings.telegram_proxy_url),
     )
     start_result: object = client.start(phone=phone)
     if inspect.isawaitable(start_result):

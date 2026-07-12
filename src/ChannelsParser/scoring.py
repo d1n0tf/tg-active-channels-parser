@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from ChannelsParser.channel_quality import matches_channel_kind
 from ChannelsParser.models import ChannelReport, SearchFilters
 
 
@@ -61,6 +62,8 @@ def matches_filters(report: ChannelReport, filters: SearchFilters, now: datetime
     if report.activity_score < filters.min_activity_score:
         return False
     if filters.min_avg_views is not None and report.avg_views_recent < filters.min_avg_views:
+        return False
+    if not matches_channel_kind(report, filters.channel_kind):
         return False
     if filters.audience_bias != "any" and report.audience.bias != filters.audience_bias:
         return False

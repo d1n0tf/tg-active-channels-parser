@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import replace
 
-from ChannelsParser.models import AgeGroup, AudienceBias, SearchFilters, SortMode
+from ChannelsParser.models import AgeGroup, AudienceBias, ChannelKind, SearchFilters, SortMode
 
 
 SET_HELP = (
@@ -14,12 +14,14 @@ SET_HELP = (
     "/set views 100\n"
     "/set views any\n"
     "/set score 35\n"
+    "/set type thematic\n"
     "/set audience female\n"
     "/set age 25-34\n"
     "/set sort views"
 )
 
 VALID_AGES: set[AgeGroup] = {"any", "14-17", "18-24", "25-34", "35+"}
+VALID_CHANNEL_KINDS: set[ChannelKind] = {"any", "thematic", "commercial"}
 VALID_SORTS: set[SortMode] = {"score", "views", "subscribers", "fresh", "reactions", "comments"}
 
 
@@ -43,6 +45,8 @@ def apply_set_command(filters: SearchFilters, raw: str) -> tuple[SearchFilters, 
         return _set_views(filters, values)
     if key in {"score", "activity", "активность"}:
         return _set_score(filters, values)
+    if key in {"type", "kind", "channel", "тип", "канал"}:
+        return _set_channel_kind(filters, values)
     if key in {"audience", "gender", "ца", "пол"}:
         return _set_audience(filters, values)
     if key in {"age", "возраст"}:
@@ -98,6 +102,39 @@ def _set_score(filters: SearchFilters, values: list[str]) -> tuple[SearchFilters
     if score < 0 or score > 100:
         raise ValueError("Score должен быть от 0 до 100")
     return replace(filters, min_activity_score=score), f"Минимальный score: {score:.0f}/100"
+
+
+def _set_channel_kind(filters: SearchFilters, values: list[str]) -> tuple[SearchFilters, str]:
+    if len(values) != 1:
+        raise ValueError("Укажи тип канала: /set type thematic|commercial|any")
+    raw = values[0].lower()
+    mapping: dict[str, ChannelKind] = {
+        "thematic": "thematic",
+        "theme": "thematic",
+        "topic": "thematic",
+        "тем": "thematic",
+        "темат": "thematic",
+        "тематический": "thematic",
+        "тематические": "thematic",
+        "commercial": "commercial",
+        "business": "commercial",
+        "shop": "commercial",
+        "agency": "commercial",
+        "ком": "commercial",
+        "коммерческий": "commercial",
+        "коммерческие": "commercial",
+        "магазины": "commercial",
+        "агентства": "commercial",
+        "any": "any",
+        "all": "any",
+        "любые": "any",
+        "любой": "any",
+        "любая": "any",
+    }
+    value = mapping.get(raw)
+    if value is None:
+        raise ValueError("Тип канала: thematic, commercial или any")
+    return replace(filters, channel_kind=value), f"Тип канала: {_channel_kind_text(value)}"
 
 
 def _set_audience(filters: SearchFilters, values: list[str]) -> tuple[SearchFilters, str]:
@@ -165,3 +202,11 @@ def _range_text(min_value: int | None, max_value: int | None) -> str:
     if max_value is None:
         return f"от {min_value}"
     return f"{min_value}-{max_value}"
+
+
+def _channel_kind_text(value: ChannelKind) -> str:
+    if value == "thematic":
+        return "тематические"
+    if value == "commercial":
+        return "коммерческие"
+    return "любые"

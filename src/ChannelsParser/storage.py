@@ -86,10 +86,14 @@ class ChannelStorage:
                     audience_age_group TEXT NOT NULL,
                     audience_keywords TEXT NOT NULL,
                     matched_queries TEXT NOT NULL,
-                    collected_at TEXT NOT NULL
+                    collected_at TEXT NOT NULL,
+                    owner_username TEXT,
+                    owner_display_name TEXT
                 )
                 """
             )
+            _ensure_column(connection, "channel_reports", "owner_username", "TEXT")
+            _ensure_column(connection, "channel_reports", "owner_display_name", "TEXT")
             connection.execute(
                 """
                 DELETE FROM channel_reports
@@ -261,9 +265,10 @@ class ChannelStorage:
                     last_post_at, post_count_24h, post_count_7d, avg_views_recent, avg_views_24h,
                     avg_reactions_recent, avg_comments_recent, view_rate, reaction_rate,
                     activity_score, audience_bias, audience_confidence, audience_age_group,
-                    audience_keywords, matched_queries, collected_at
+                    audience_keywords, matched_queries, collected_at,
+                    owner_username, owner_display_name
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [_report_row(scan_id, report) for report in reports],
             )
@@ -354,6 +359,8 @@ def _report_row(scan_id: str, report: ChannelReport) -> tuple[object, ...]:
         json.dumps(report.audience.matched_keywords, ensure_ascii=False),
         json.dumps(report.matched_queries, ensure_ascii=False),
         _dt(collected_at),
+        report.owner_username,
+        report.owner_display_name,
     )
 
 
@@ -413,6 +420,8 @@ def _row_report(row: sqlite3.Row) -> ChannelReport:
         audience=audience,
         matched_queries=_json_list(row["matched_queries"]),
         collected_at=_parse_dt(row["collected_at"]),
+        owner_username=row["owner_username"],
+        owner_display_name=row["owner_display_name"],
     )
 
 
@@ -461,6 +470,12 @@ def _json_list(value: str | None) -> list[str]:
     if not isinstance(raw, list):
         return []
     return [str(item) for item in raw]
+
+
+def _ensure_column(connection: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
+    columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
 
 def _normalize_filter_preset_title(title: str) -> str:

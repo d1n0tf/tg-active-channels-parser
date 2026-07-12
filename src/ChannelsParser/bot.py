@@ -2,19 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from ChannelsParser.collector import TelegramChannelCollector
-from ChannelsParser.commands import SET_HELP, VALID_AGES, VALID_SORTS, apply_set_command, parse_queries
+from ChannelsParser.commands import SET_HELP, VALID_AGES, VALID_CHANNEL_KINDS, VALID_SORTS, apply_set_command, parse_queries
 from ChannelsParser.config import AppSettings, ConfigError
 from ChannelsParser.formatting import (
+    format_discovery_stats,
     format_filter_presets,
     format_filters,
     format_report,
@@ -23,8 +27,9 @@ from ChannelsParser.formatting import (
     format_scan_history,
     reports_to_csv,
 )
-from ChannelsParser.models import FilterPreset, SearchFilters
+from ChannelsParser.models import DiscoveryOptions, FilterPreset, SearchFilters, discovery_filters
 from ChannelsParser.presets import QUERY_PRESETS, get_preset
+from ChannelsParser.proxy import aiogram_proxy
 from ChannelsParser.scoring import matches_filters
 from ChannelsParser.storage import ChannelStorage
 
@@ -33,7 +38,9 @@ class BotState:
     def __init__(self, storage: ChannelStorage) -> None:
         self._storage = storage
         self.scan_lock = asyncio.Lock()
-        self._pending_filter_preset_titles: set[int] = set()
+        self._scan_cancel_requested = asyncio.Event()
+        self._scan_finish_collection_requested = asyncio.Event()
+        self._pending_input: dict[int, str] = {}
 
     def filters(self, user_id: int) -> SearchFilters:
         return self._storage.get_user_filters(user_id)
@@ -61,14 +68,43 @@ class BotState:
     def delete_filter_preset(self, user_id: int, preset_id: int) -> bool:
         return self._storage.delete_filter_preset(user_id, preset_id)
 
+    def request_input(self, user_id: int, kind: str) -> None:
+        self._pending_input[user_id] = kind
+
+    def pending_input(self, user_id: int) -> str | None:
+        return self._pending_input.get(user_id)
+
+    def clear_pending_input(self, user_id: int) -> None:
+        self._pending_input.pop(user_id, None)
+
     def request_filter_preset_title(self, user_id: int) -> None:
-        self._pending_filter_preset_titles.add(user_id)
+        self.request_input(user_id, "filter_preset_title")
 
     def is_waiting_for_filter_preset_title(self, user_id: int) -> bool:
-        return user_id in self._pending_filter_preset_titles
+        return self.pending_input(user_id) == "filter_preset_title"
 
     def clear_filter_preset_title_request(self, user_id: int) -> None:
-        self._pending_filter_preset_titles.discard(user_id)
+        if self.is_waiting_for_filter_preset_title(user_id):
+            self.clear_pending_input(user_id)
+
+    def reset_scan_cancel(self) -> None:
+        self._scan_cancel_requested.clear()
+        self._scan_finish_collection_requested.clear()
+
+    def finish_scan_collection(self) -> None:
+        """Soft stop: end post/comment browsing, still inspect collected candidates."""
+        self._scan_finish_collection_requested.set()
+
+    def cancel_scan(self) -> None:
+        """Hard stop: abort browsing and candidate inspection ASAP."""
+        self._scan_cancel_requested.set()
+        self._scan_finish_collection_requested.set()
+
+    def scan_cancelled(self) -> bool:
+        return self._scan_cancel_requested.is_set()
+
+    def scan_finish_collection_requested(self) -> bool:
+        return self._scan_finish_collection_requested.is_set()
 
 
 def main() -> None:
@@ -89,7 +125,7 @@ async def run_bot() -> None:
 
     bot: Bot | None = None
     try:
-        bot = Bot(settings.bot_token or "")
+        bot = Bot(settings.bot_token or "", session=AiohttpSession(proxy=aiogram_proxy(settings.bot_proxy_url)))
         dispatcher = Dispatcher()
         dispatcher.include_router(build_router(collector, storage, settings))
         await bot.delete_webhook(drop_pending_updates=True)
@@ -113,29 +149,11 @@ def build_router(
         if not message.from_user:
             return
         storage.save_user_filters(message.from_user.id, state.filters(message.from_user.id))
-        text = (
-            "Я ищу активные Telegram-каналы для закупки рекламы.\n\n"
-            "Начни с готового поиска или настрой фильтры под закуп.\n"
-            "Свои запросы можно запускать так: /find семейный бюджет, финансы для женщин\n\n"
-            "Пол и возраст здесь оценочные: Telegram публично не раскрывает демографию каналов."
-        )
-        await message.answer(text, reply_markup=main_keyboard())
+        await message.answer(format_main_menu(), reply_markup=main_keyboard())
 
     @router.message(Command("help"))
     async def help_message(message: Message) -> None:
-        await message.answer(
-            "/find запрос1, запрос2 - поиск каналов\n"
-            "/check @channel - аудит конкретного канала\n"
-            "/filters - панель настройки фильтров\n"
-            "/savefilter Название - сохранить текущие фильтры в свой пресет\n"
-            "/filterpresets - мои пресеты фильтров\n"
-            "/set - точная настройка фильтров\n"
-            "/presets - готовые наборы запросов\n"
-            "/latest - последние найденные каналы\n"
-            "/history - история сканов\n"
-            "/export - CSV последнего скана\n\n"
-            f"{SET_HELP}"
-        )
+        await message.answer(format_help(), reply_markup=support_keyboard())
 
     @router.message(Command("filters"))
     async def filters_message(message: Message) -> None:
@@ -177,7 +195,7 @@ def build_router(
             await message.answer(str(exc))
             return
         await message.answer(
-            f"Сохранил пресет фильтров: {preset.title}\n\n{format_filter_dashboard(preset.filters)}",
+            f"✅ Пресет фильтров сохранён: {preset.title}\n\n{format_filter_dashboard(preset.filters)}",
             reply_markup=filter_presets_keyboard(state.filter_presets(message.from_user.id)),
         )
 
@@ -215,11 +233,35 @@ def build_router(
         queries = parse_queries(command.args or "")
         if not queries:
             await message.answer(
-                "Дай ключевые слова после команды, например:\n"
-                "/find семейный бюджет, финансы для женщин, деньги в декрете"
+                "🔎 Для поиска нужны ключевые слова.\n\n"
+                "Примеры:\n"
+                "/find женский блог, канал про моду\n"
+                "/find рецепты и кулинария",
+                reply_markup=parsing_keyboard(),
             )
             return
         await run_scan(message, queries, state, collector, storage, settings, user_id=message.from_user.id)
+
+    @router.message(Command("discover"))
+    async def discover_message(message: Message, command: CommandObject) -> None:
+        if not message.from_user:
+            return
+        try:
+            identifier, post_limit, discovery_options = parse_discover_args(command.args or "")
+        except ValueError as exc:
+            await message.answer(str(exc))
+            return
+        await run_discovery(
+            message,
+            identifier,
+            post_limit,
+            state,
+            collector,
+            storage,
+            settings,
+            user_id=message.from_user.id,
+            discovery_options=discovery_options,
+        )
 
     @router.message(Command("check"))
     async def check_message(message: Message, command: CommandObject) -> None:
@@ -227,32 +269,80 @@ def build_router(
             return
         identifier = (command.args or "").strip()
         if not identifier:
-            await message.answer("Укажи канал: /check @channel или /check https://t.me/channel")
+            await message.answer("Нужен канал: /check @channel или /check https://t.me/channel")
             return
         await run_audit(message, identifier, state, collector, storage, user_id=message.from_user.id)
 
     @router.message(F.text)
-    async def pending_filter_preset_title_message(message: Message) -> None:
+    async def pending_input_message(message: Message) -> None:
         if not message.from_user or not message.text:
             return
         user_id = message.from_user.id
-        if not state.is_waiting_for_filter_preset_title(user_id):
+        pending = state.pending_input(user_id)
+        if not pending:
             return
-        if message.text.startswith("/"):
-            state.clear_filter_preset_title_request(user_id)
-            await message.answer("Ок, сохранение пресета отменено.", reply_markup=filters_keyboard(state.filters(user_id)))
+
+        text = message.text.strip()
+        if text.startswith("/"):
+            state.clear_pending_input(user_id)
+            await message.answer("Ок, ввод отменён.", reply_markup=main_keyboard())
             return
-        try:
-            preset = state.save_filter_preset(user_id, message.text)
-        except ValueError as exc:
-            await message.answer(str(exc), reply_markup=filter_preset_name_keyboard())
+
+        if pending == "filter_preset_title":
+            try:
+                preset = state.save_filter_preset(user_id, text)
+            except ValueError as exc:
+                await message.answer(str(exc), reply_markup=filter_preset_name_keyboard())
+                return
+            state.clear_pending_input(user_id)
+            presets = state.filter_presets(user_id)
+            await message.answer(
+                f"✅ Пресет фильтров сохранён: {preset.title}\n\n{format_filter_dashboard(preset.filters)}",
+                reply_markup=filter_presets_keyboard(presets),
+            )
             return
-        state.clear_filter_preset_title_request(user_id)
-        presets = state.filter_presets(user_id)
-        await message.answer(
-            f"Сохранил пресет фильтров: {preset.title}\n\n{format_filter_dashboard(preset.filters)}",
-            reply_markup=filter_presets_keyboard(presets),
-        )
+
+        if pending == "find":
+            state.clear_pending_input(user_id)
+            queries = parse_queries(text)
+            if not queries:
+                await message.answer(
+                    "Нужны ключевые слова через запятую.\nПример: женский блог, канал про моду",
+                    reply_markup=parsing_keyboard(),
+                )
+                return
+            await run_scan(message, queries, state, collector, storage, settings, user_id=user_id)
+            return
+
+        if pending == "check":
+            state.clear_pending_input(user_id)
+            if not text:
+                await message.answer("Нужен канал: @channel или https://t.me/channel", reply_markup=parsing_keyboard())
+                return
+            await run_audit(message, text, state, collector, storage, user_id=user_id)
+            return
+
+        if pending == "discover":
+            state.clear_pending_input(user_id)
+            try:
+                identifier, post_limit, discovery_options = parse_discover_args(text)
+            except ValueError as exc:
+                await message.answer(str(exc), reply_markup=parsing_keyboard())
+                return
+            await run_discovery(
+                message,
+                identifier,
+                post_limit,
+                state,
+                collector,
+                storage,
+                settings,
+                user_id=user_id,
+                discovery_options=discovery_options,
+            )
+            return
+
+        state.clear_pending_input(user_id)
 
     @router.callback_query(F.data == "filters")
     async def filters_callback(callback: CallbackQuery) -> None:
@@ -260,7 +350,7 @@ def build_router(
         if not callback.from_user or message is None:
             return
         filters = state.filters(callback.from_user.id)
-        await message.answer(format_filter_dashboard(filters), reply_markup=filters_keyboard(filters))
+        await _edit_or_answer(message, format_filter_dashboard(filters), reply_markup=filters_keyboard(filters))
         await callback.answer()
 
     @router.callback_query(F.data == "filters:dashboard")
@@ -283,9 +373,25 @@ def build_router(
             text = format_filter_section(section, filters)
             keyboard = filter_section_keyboard(section, filters)
         except ValueError:
-            await callback.answer("Раздел не найден", show_alert=True)
+            await callback.answer("Не найдено", show_alert=True)
             return
         await message.edit_text(text, reply_markup=keyboard)
+        await callback.answer()
+
+    @router.callback_query(F.data == "menu:main")
+    async def main_menu_callback(callback: CallbackQuery) -> None:
+        message = _callback_message(callback)
+        if message is None:
+            return
+        await _edit_or_answer(message, format_main_menu(), reply_markup=main_keyboard())
+        await callback.answer()
+
+    @router.callback_query(F.data == "parsing")
+    async def parsing_callback(callback: CallbackQuery) -> None:
+        message = _callback_message(callback)
+        if message is None:
+            return
+        await _edit_or_answer(message, format_parsing_menu(), reply_markup=parsing_keyboard())
         await callback.answer()
 
     @router.callback_query(F.data == "presets")
@@ -293,7 +399,112 @@ def build_router(
         message = _callback_message(callback)
         if message is None:
             return
-        await message.answer("Готовые наборы запросов:", reply_markup=presets_keyboard())
+        await _edit_or_answer(
+            message,
+            "🧩 Готовые наборы запросов\n\nВыбери вертикаль — поиск стартует сразу с текущими фильтрами.",
+            reply_markup=presets_keyboard(),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data == "prompt:find")
+    async def prompt_find_callback(callback: CallbackQuery) -> None:
+        message = _callback_message(callback)
+        if not callback.from_user or message is None:
+            return
+        state.request_input(callback.from_user.id, "find")
+        await _edit_or_answer(
+            message,
+            "🔎 Свой поиск\n\n"
+            "Отправь ключевые слова одним сообщением — через запятую или с новой строки.\n\n"
+            "Пример:\nженская одежда, шоурум, wildberries",
+            reply_markup=cancel_input_keyboard(),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data == "prompt:check")
+    async def prompt_check_callback(callback: CallbackQuery) -> None:
+        message = _callback_message(callback)
+        if not callback.from_user or message is None:
+            return
+        state.request_input(callback.from_user.id, "check")
+        await _edit_or_answer(
+            message,
+            "🧪 Проверка канала\n\n"
+            "Отправь @username или ссылку t.me/...\n\n"
+            "Пример:\n@durov",
+            reply_markup=cancel_input_keyboard(),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data == "prompt:discover")
+    async def prompt_discover_callback(callback: CallbackQuery) -> None:
+        message = _callback_message(callback)
+        if not callback.from_user or message is None:
+            return
+        state.request_input(callback.from_user.id, "discover")
+        await _edit_or_answer(
+            message,
+            "🔗 Discovery\n\n"
+            "Отправь донорский канал и опции одной строкой.\n\n"
+            "Примеры:\n"
+            "@source_channel 200\n"
+            "@source_channel 200 gifts off\n"
+            "@source_channel 200 comments on profile on gifts off subs 100 300\n\n"
+            "Подарки: gifts on | gifts off (по умолчанию on)\n"
+            "«Завершить досрочно» — останавливает обход постов, но дочищает уже найденных кандидатов.",
+            reply_markup=cancel_input_keyboard(),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data == "input:cancel")
+    async def input_cancel_callback(callback: CallbackQuery) -> None:
+        message = _callback_message(callback)
+        if not callback.from_user or message is None:
+            return
+        state.clear_pending_input(callback.from_user.id)
+        await _edit_or_answer(message, format_parsing_menu(), reply_markup=parsing_keyboard())
+        await callback.answer("Отменено")
+
+    @router.callback_query(F.data == "database")
+    async def database_callback(callback: CallbackQuery) -> None:
+        message = _callback_message(callback)
+        if not callback.from_user or message is None:
+            return
+        scans = storage.list_scans(user_id=callback.from_user.id, limit=1)
+        reports = storage.latest_reports(user_id=callback.from_user.id, limit=1)
+        await _edit_or_answer(
+            message,
+            format_database_menu(has_history=bool(scans), has_results=bool(reports)),
+            reply_markup=database_keyboard(),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data == "accounts")
+    async def accounts_callback(callback: CallbackQuery) -> None:
+        message = _callback_message(callback)
+        if message is None:
+            return
+        await _edit_or_answer(
+            message,
+            format_accounts_menu(settings.telegram_session),
+            reply_markup=accounts_keyboard(),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data == "subscription")
+    async def subscription_callback(callback: CallbackQuery) -> None:
+        message = _callback_message(callback)
+        if message is None:
+            return
+        await _edit_or_answer(message, format_subscription_menu(), reply_markup=main_keyboard())
+        await callback.answer()
+
+    @router.callback_query(F.data == "support")
+    async def support_callback(callback: CallbackQuery) -> None:
+        message = _callback_message(callback)
+        if message is None:
+            return
+        await _edit_or_answer(message, format_help(), reply_markup=support_keyboard())
         await callback.answer()
 
     @router.callback_query(F.data == "filterpresets")
@@ -302,7 +513,11 @@ def build_router(
         if not callback.from_user or message is None:
             return
         presets = state.filter_presets(callback.from_user.id)
-        await message.answer(format_filter_presets(presets), reply_markup=filter_presets_keyboard(presets))
+        await _edit_or_answer(
+            message,
+            format_filter_presets(presets),
+            reply_markup=filter_presets_keyboard(presets),
+        )
         await callback.answer()
 
     @router.callback_query(F.data == "filterpreset:save:auto")
@@ -313,10 +528,10 @@ def build_router(
         preset = state.save_filter_preset(callback.from_user.id, _auto_filter_preset_title())
         presets = state.filter_presets(callback.from_user.id)
         await message.edit_text(
-            f"Сохранил пресет фильтров: {preset.title}\n\n{format_filter_dashboard(preset.filters)}",
+            f"✅ Пресет фильтров сохранён: {preset.title}\n\n{format_filter_dashboard(preset.filters)}",
             reply_markup=filter_presets_keyboard(presets),
         )
-        await callback.answer("Пресет сохранен")
+        await callback.answer("Пресет сохранён")
 
     @router.callback_query(F.data == "filterpreset:save:named")
     async def filter_preset_save_named_callback(callback: CallbackQuery) -> None:
@@ -325,7 +540,7 @@ def build_router(
             return
         state.request_filter_preset_title(callback.from_user.id)
         await message.edit_text(
-            "Как назвать пресет фильтров?\n\nНапиши название одним сообщением, например: Малые женские 100-300.",
+            "Название пресета\n\nОтправь короткое название, например: каналы 100-300.",
             reply_markup=filter_preset_name_keyboard(),
         )
         await callback.answer()
@@ -351,13 +566,13 @@ def build_router(
             return
         preset = state.apply_filter_preset(callback.from_user.id, preset_id)
         if preset is None:
-            await callback.answer("Пресет не найден", show_alert=True)
+            await callback.answer("Не найдено", show_alert=True)
             return
         await message.edit_text(
-            f"Применил пресет фильтров: {preset.title}\n\n{format_filter_dashboard(preset.filters)}",
+            f"✅ Применён пресет: {preset.title}\n\n{format_filter_dashboard(preset.filters)}",
             reply_markup=filters_keyboard(preset.filters),
         )
-        await callback.answer("Фильтры применены")
+        await callback.answer("Пресет применён")
 
     @router.callback_query(F.data.startswith("filterpreset:delete:"))
     async def filter_preset_delete_callback(callback: CallbackQuery) -> None:
@@ -369,7 +584,7 @@ def build_router(
             await callback.answer("Некорректный пресет", show_alert=True)
             return
         if not state.delete_filter_preset(callback.from_user.id, preset_id):
-            await callback.answer("Пресет не найден", show_alert=True)
+            await callback.answer("Не найдено", show_alert=True)
             return
         presets = state.filter_presets(callback.from_user.id)
         await message.edit_text(format_filter_presets(presets), reply_markup=filter_presets_keyboard(presets))
@@ -383,7 +598,7 @@ def build_router(
         preset_key = callback.data.split(":", 1)[1]
         preset = get_preset(preset_key)
         if not preset:
-            await callback.answer("Пресет не найден", show_alert=True)
+            await callback.answer("Не найдено", show_alert=True)
             return
         await callback.answer("Запускаю поиск")
         await run_scan(
@@ -423,6 +638,22 @@ def build_router(
         await export_latest(message, storage, callback.from_user.id)
         await callback.answer()
 
+    @router.callback_query(F.data == "scan:finish")
+    async def scan_finish_callback(callback: CallbackQuery) -> None:
+        if not state.scan_lock.locked():
+            await callback.answer("Активного поиска нет")
+            return
+        state.finish_scan_collection()
+        await callback.answer("Завершаю обход постов, дальше обработаю найденных кандидатов")
+
+    @router.callback_query(F.data == "scan:cancel")
+    async def scan_cancel_callback(callback: CallbackQuery) -> None:
+        if not state.scan_lock.locked():
+            await callback.answer("Активного поиска нет")
+            return
+        state.cancel_scan()
+        await callback.answer("Останавливаю полностью")
+
     @router.callback_query(F.data == "filters:reset")
     async def filters_reset_callback(callback: CallbackQuery) -> None:
         message = _callback_message(callback)
@@ -442,12 +673,12 @@ def build_router(
             min_value = None if min_raw == "none" else int(min_raw)
             max_value = None if max_raw == "none" else int(max_raw)
         except ValueError:
-            await callback.answer("Некорректный фильтр подписчиков", show_alert=True)
+            await callback.answer("Некорректный диапазон подписчиков", show_alert=True)
             return
         filters = replace(state.filters(callback.from_user.id), min_subscribers=min_value, max_subscribers=max_value)
         state.update_filters(callback.from_user.id, filters)
         await message.edit_text(format_filter_section("subs", filters), reply_markup=filter_section_keyboard("subs", filters))
-        await callback.answer("Фильтр подписчиков обновлен")
+        await callback.answer("Подписчики обновлены")
 
     @router.callback_query(F.data.startswith("active:"))
     async def active_callback(callback: CallbackQuery) -> None:
@@ -457,12 +688,12 @@ def build_router(
         try:
             days = int(callback.data.split(":")[1])
         except (IndexError, ValueError):
-            await callback.answer("Некорректный фильтр свежести", show_alert=True)
+            await callback.answer("Некорректный срок активности", show_alert=True)
             return
         filters = replace(state.filters(callback.from_user.id), max_last_post_days=days)
         state.update_filters(callback.from_user.id, filters)
         await message.edit_text(format_filter_section("fresh", filters), reply_markup=filter_section_keyboard("fresh", filters))
-        await callback.answer("Фильтр свежести обновлен")
+        await callback.answer("Активность обновлена")
 
     @router.callback_query(F.data.startswith("views:"))
     async def views_callback(callback: CallbackQuery) -> None:
@@ -473,12 +704,12 @@ def build_router(
             raw_value = callback.data.split(":")[1]
             min_views = None if raw_value == "none" else int(raw_value)
         except (IndexError, ValueError):
-            await callback.answer("Некорректный фильтр просмотров", show_alert=True)
+            await callback.answer("Некорректный порог просмотров", show_alert=True)
             return
         filters = replace(state.filters(callback.from_user.id), min_avg_views=min_views)
         state.update_filters(callback.from_user.id, filters)
         await message.edit_text(format_filter_section("views", filters), reply_markup=filter_section_keyboard("views", filters))
-        await callback.answer("Фильтр просмотров обновлен")
+        await callback.answer("Просмотры обновлены")
 
     @router.callback_query(F.data.startswith("scoremin:"))
     async def score_min_callback(callback: CallbackQuery) -> None:
@@ -488,12 +719,30 @@ def build_router(
         try:
             value = float(callback.data.split(":")[1])
         except (IndexError, ValueError):
-            await callback.answer("Некорректный порог активности", show_alert=True)
+            await callback.answer("Некорректный скор активности", show_alert=True)
             return
         filters = replace(state.filters(callback.from_user.id), min_activity_score=value)
         state.update_filters(callback.from_user.id, filters)
         await message.edit_text(format_filter_section("score", filters), reply_markup=filter_section_keyboard("score", filters))
-        await callback.answer("Порог активности обновлен")
+        await callback.answer("Скор активности обновлен")
+
+    @router.callback_query(F.data.startswith("kind:"))
+    async def channel_kind_callback(callback: CallbackQuery) -> None:
+        message = _callback_message(callback)
+        if not callback.from_user or message is None or not callback.data:
+            return
+        try:
+            value = callback.data.split(":")[1]
+        except IndexError:
+            await callback.answer("Некорректный тип канала", show_alert=True)
+            return
+        if value not in VALID_CHANNEL_KINDS:
+            await callback.answer("Некорректный тип канала", show_alert=True)
+            return
+        filters = replace(state.filters(callback.from_user.id), channel_kind=value)
+        state.update_filters(callback.from_user.id, filters)
+        await message.edit_text(format_filter_section("kind", filters), reply_markup=filter_section_keyboard("kind", filters))
+        await callback.answer("Тип канала обновлен")
 
     @router.callback_query(F.data.startswith("audience:"))
     async def audience_callback(callback: CallbackQuery) -> None:
@@ -503,15 +752,15 @@ def build_router(
         try:
             value = callback.data.split(":")[1]
         except IndexError:
-            await callback.answer("Некорректный фильтр аудитории", show_alert=True)
+            await callback.answer("Некорректная аудитория", show_alert=True)
             return
         if value not in {"any", "female", "male"}:
-            await callback.answer("Некорректный фильтр аудитории", show_alert=True)
+            await callback.answer("Некорректная аудитория", show_alert=True)
             return
         filters = replace(state.filters(callback.from_user.id), audience_bias=value)
         state.update_filters(callback.from_user.id, filters)
         await message.edit_text(format_filter_section("audience", filters), reply_markup=filter_section_keyboard("audience", filters))
-        await callback.answer("Фильтр аудитории обновлен")
+        await callback.answer("Аудитория обновлена")
 
     @router.callback_query(F.data.startswith("age:"))
     async def age_callback(callback: CallbackQuery) -> None:
@@ -521,15 +770,15 @@ def build_router(
         try:
             value = callback.data.split(":")[1]
         except IndexError:
-            await callback.answer("Некорректный фильтр возраста", show_alert=True)
+            await callback.answer("Некорректный возраст", show_alert=True)
             return
         if value not in VALID_AGES:
-            await callback.answer("Некорректный фильтр возраста", show_alert=True)
+            await callback.answer("Некорректный возраст", show_alert=True)
             return
         filters = replace(state.filters(callback.from_user.id), age_group=value)
         state.update_filters(callback.from_user.id, filters)
         await message.edit_text(format_filter_section("age", filters), reply_markup=filter_section_keyboard("age", filters))
-        await callback.answer("Фильтр возраста обновлен")
+        await callback.answer("Возраст обновлен")
 
     @router.callback_query(F.data.startswith("sort:"))
     async def sort_callback(callback: CallbackQuery) -> None:
@@ -564,10 +813,11 @@ async def run_scan(
     title: str | None = None,
 ) -> None:
     if state.scan_lock.locked():
-        await message.answer("Сейчас уже идет поиск. Дождись результата и запусти следующий.")
+        await message.answer("Сейчас уже идет поиск. Дождись завершения или нажми «Завершить досрочно».")
         return
 
     await state.scan_lock.acquire()
+    state.reset_scan_cancel()
     try:
         filters = state.filters(user_id)
         scan_id = uuid.uuid4().hex
@@ -575,27 +825,161 @@ async def run_scan(
 
         query_preview = ", ".join(queries[:5])
         if len(queries) > 5:
-            query_preview += f" и еще {len(queries) - 5}"
+            query_preview += f" и ещё {len(queries) - 5}"
         label = f"{title}\n" if title else ""
-        await message.answer(f"{label}Запустил поиск: {query_preview}\n\n{format_filters(filters)}")
+        await message.answer(
+            format_scan_progress_card(
+                title="🔎 Поиск каналов",
+                progress_label="запросы",
+                processed=0,
+                total=len(queries),
+                found=0,
+                started_at=datetime.now(timezone.utc),
+                details=f"{label}{query_preview}\n\n{format_filters(filters)}",
+            ),
+            reply_markup=scan_cancel_keyboard(),
+        )
 
         try:
-            result = await collector.search_channels(queries, filters)
+            # For keyword search there is no separate "inspect candidates" phase:
+            # soft finish and hard cancel both stop remaining queries.
+            result = await collector.search_channels(
+                queries,
+                filters,
+                should_stop=lambda: state.scan_cancelled() or state.scan_finish_collection_requested(),
+            )
             reports = result.reports
             storage.save_reports(scan_id, reports)
             storage.finish_scan(scan_id, total_candidates=result.total_candidates, total_reports=len(reports))
         except Exception as exc:
             storage.fail_scan(scan_id, error=str(exc))
-            await message.answer(f"Поиск упал: {exc}\nscan_id: {scan_id[:8]}")
+            await message.answer(f"Ошибка поиска: {exc}\nscan_id: {scan_id[:8]}")
             return
 
         summary = format_scan_done(scan_id, result.total_candidates, len(reports), result.errors)
         await answer_long(
             message,
-            f"{summary}\n\n{format_reports(reports, limit=settings.top_results)}",
+            f"{summary}\n\n{format_reports(reports, limit=_scan_results_limit(reports, settings))}",
             reply_markup=results_keyboard(bool(reports)),
         )
     finally:
+        state.reset_scan_cancel()
+        state.scan_lock.release()
+
+
+async def run_discovery(
+    message: Message,
+    identifier: str,
+    post_limit: int,
+    state: BotState,
+    collector: TelegramChannelCollector,
+    storage: ChannelStorage,
+    settings: AppSettings,
+    *,
+    user_id: int,
+    discovery_options: DiscoveryOptions | None = None,
+) -> None:
+    if state.scan_lock.locked():
+        await message.answer("Сейчас уже идет поиск. Дождись завершения или нажми «Завершить досрочно».")
+        return
+
+    await state.scan_lock.acquire()
+    state.reset_scan_cancel()
+    try:
+        discovery_options = discovery_options or DiscoveryOptions()
+        filters = discovery_filters(state.filters(user_id), discovery_options)
+        scan_id = uuid.uuid4().hex
+        queries = [identifier, f"posts:{post_limit}", *_discovery_option_tokens(discovery_options)]
+        storage.create_scan(scan_id, user_id=user_id, mode="discover", queries=queries, filters=filters)
+        gift_limit = settings.discovery_gift_limit if discovery_options.include_gifts else 0
+        started_at = datetime.now(timezone.utc)
+
+        progress_message = await message.answer(
+            format_discovery_progress_card(
+                identifier=identifier,
+                post_limit=post_limit,
+                stats={},
+                started_at=started_at,
+                discovery_options=discovery_options,
+                gift_limit=gift_limit,
+            ),
+            reply_markup=scan_cancel_keyboard(),
+        )
+        last_progress_update = 0.0
+
+        async def update_progress(stats: dict[str, int]) -> None:
+            nonlocal last_progress_update
+            now = time.monotonic()
+            if now - last_progress_update < 2.0:
+                return
+            last_progress_update = now
+            if not hasattr(progress_message, "edit_text"):
+                return
+            try:
+                await progress_message.edit_text(
+                    format_discovery_progress_card(
+                        identifier=identifier,
+                        post_limit=post_limit,
+                        stats=stats,
+                        started_at=started_at,
+                        discovery_options=discovery_options,
+                        gift_limit=gift_limit,
+                    ),
+                    reply_markup=scan_cancel_keyboard(),
+                )
+            except Exception:
+                logging.debug("Could not edit discovery progress message", exc_info=True)
+
+        try:
+            result = await collector.discover_channels_from_comments(
+                identifier,
+                filters,
+                post_limit=post_limit,
+                comments_per_post=settings.discovery_comments_per_post,
+                profile_limit=settings.discovery_profile_limit,
+                candidate_limit=settings.discovery_candidate_limit,
+                gift_limit=gift_limit,
+                include_comment_links=discovery_options.include_comment_links,
+                include_profile_refs=discovery_options.include_profile_refs,
+                should_stop=state.scan_cancelled,
+                should_finish_collection=state.scan_finish_collection_requested,
+                progress_callback=update_progress,
+            )
+            reports = result.reports
+            storage.save_reports(scan_id, reports)
+            storage.finish_scan(scan_id, total_candidates=result.total_candidates, total_reports=len(reports))
+        except Exception as exc:
+            storage.fail_scan(scan_id, error=str(exc))
+            await message.answer(f"Ошибка discovery: {exc}\nscan_id: {scan_id[:8]}")
+            return
+
+        if hasattr(progress_message, "edit_text"):
+            try:
+                await progress_message.edit_text(
+                    format_discovery_progress_card(
+                        identifier=identifier,
+                        post_limit=post_limit,
+                        stats=result.stats or {},
+                        started_at=started_at,
+                        discovery_options=discovery_options,
+                        gift_limit=gift_limit,
+                        done=True,
+                    )
+                )
+            except Exception:
+                logging.debug("Could not finalize discovery progress message", exc_info=True)
+
+        summary = format_scan_done(scan_id, result.total_candidates, len(reports), result.errors)
+        discovery_stats = format_discovery_stats(result)
+        if discovery_stats:
+            summary = f"{summary}\n\n{discovery_stats}"
+        await answer_long(
+            message,
+            f"{summary}\n\n{format_reports(reports, limit=_scan_results_limit(reports, settings))}",
+            reply_markup=results_keyboard(bool(reports)),
+        )
+    finally:
+        state.reset_scan_cancel()
         state.scan_lock.release()
 
 
@@ -609,7 +993,7 @@ async def run_audit(
     user_id: int,
 ) -> None:
     if state.scan_lock.locked():
-        await message.answer("Сейчас уже идет поиск. Дождись результата и запусти следующий.")
+        await message.answer("Сейчас уже идет поиск. Дождись завершения или нажми «Завершить досрочно».")
         return
 
     await state.scan_lock.acquire()
@@ -617,7 +1001,7 @@ async def run_audit(
         filters = state.filters(user_id)
         scan_id = uuid.uuid4().hex
         storage.create_scan(scan_id, user_id=user_id, mode="audit", queries=[identifier], filters=filters)
-        await message.answer(f"Проверяю канал {identifier}...")
+        await message.answer(f"🧪 Проверяю {identifier}…")
 
         try:
             report = await collector.inspect_channel_identifier(identifier)
@@ -625,11 +1009,15 @@ async def run_audit(
             storage.finish_scan(scan_id, total_candidates=1, total_reports=1)
         except Exception as exc:
             storage.fail_scan(scan_id, error=str(exc), total_candidates=1)
-            await message.answer(f"Не смог проверить канал: {exc}\nscan_id: {scan_id[:8]}")
+            await message.answer(f"❌ Ошибка проверки: {exc}\nscan_id: {scan_id[:8]}")
             return
 
-        filter_status = "Проходит текущие фильтры" if matches_filters(report, filters) else "Не проходит текущие фильтры"
-        await message.answer(f"{filter_status}\nscan_id: {scan_id[:8]}\n\n{format_report(report)}", reply_markup=results_keyboard(True))
+        passes = matches_filters(report, filters)
+        filter_status = "✅ Проходит текущие фильтры" if passes else "⚠️ Не проходит текущие фильтры"
+        await message.answer(
+            f"{filter_status}\nscan_id: {scan_id[:8]}\n\n{format_report(report)}",
+            reply_markup=results_keyboard(True),
+        )
     finally:
         state.scan_lock.release()
 
@@ -637,16 +1025,16 @@ async def run_audit(
 async def export_latest(message: Message, storage: ChannelStorage, user_id: int) -> None:
     scan_id = storage.latest_scan_id(user_id=user_id, only_done=True, require_reports=True)
     if scan_id is None:
-        await message.answer("Пока нечего экспортировать. Сначала запусти поиск или /check.")
+        await message.answer("Нет сохраненных результатов. Сначала запусти /search, /discover или /check.")
         return
     reports = storage.latest_reports(scan_id=scan_id, limit=500)
     if not reports:
-        await message.answer("Пока нечего экспортировать. Сначала запусти поиск или /check.")
+        await message.answer("Нет сохраненных результатов. Сначала запусти /search, /discover или /check.")
         return
     payload = reports_to_csv(reports)
     await message.answer_document(
         BufferedInputFile(payload, filename=f"telegram_channels_{scan_id[:8]}.csv"),
-        caption="CSV с последними результатами",
+        caption=f"📊 CSV · {len(reports)} каналов · scan {scan_id[:8]}",
     )
 
 
@@ -654,110 +1042,495 @@ def _callback_message(callback: CallbackQuery) -> Message | None:
     return callback.message if isinstance(callback.message, Message) else None
 
 
-def _callback_int(data: str, prefix: str) -> int | None:
-    if not data.startswith(prefix):
+def parse_discover_args(raw: str) -> tuple[str, int, DiscoveryOptions]:
+    tokens = raw.strip().split()
+    if not tokens:
+        raise ValueError("Нужен канал: /discover @channel 200")
+    identifier = tokens[0]
+    post_limit = 100
+    index = 1
+    if len(tokens) > 1 and _looks_int(tokens[1]):
+        index = 2
+        try:
+            post_limit = int(tokens[1])
+        except ValueError as exc:
+            raise ValueError("Некорректный лимит постов. Пример: /discover @channel 200") from exc
+    if post_limit < 1 or post_limit > 500:
+        raise ValueError("Лимит постов для discovery должен быть от 1 до 500")
+    options = DiscoveryOptions()
+    while index < len(tokens):
+        key, value, consumed = _option_token(tokens, index)
+        key = key.lower().lstrip("-")
+        if key in {"comments", "comment", "comment-links", "комменты", "комментарии"}:
+            options.include_comment_links = _parse_on_off(value, key)
+        elif key in {"profile", "profiles", "attached", "personal", "профиль", "профили", "описание"}:
+            options.include_profile_refs = _parse_on_off(value, key)
+        elif key in {"gifts", "gift", "подарки", "подарок"}:
+            options.include_gifts = _parse_on_off(value, key)
+        elif key in {"subs", "subscribers", "пдп", "подписчики"}:
+            min_subs, max_subs, consumed = _parse_discovery_subs(tokens, index, value, consumed)
+            if min_subs is not None and max_subs is not None and min_subs > max_subs:
+                raise ValueError("Минимум подписчиков не может быть больше максимума")
+            options.min_subscribers = min_subs
+            options.max_subscribers = max_subs
+        else:
+            raise ValueError(
+                "Не знаю такую опцию discovery. Пример: /discover @channel 200 comments off gifts on subs 100 300"
+            )
+        index += consumed
+    if not (options.include_comment_links or options.include_profile_refs or options.include_gifts):
+        raise ValueError("Включи хотя бы один источник: comments, profile или gifts")
+    return identifier, post_limit, options
+
+
+def _option_token(tokens: list[str], index: int) -> tuple[str, str | None, int]:
+    token = tokens[index]
+    if ":" in token:
+        key, value = token.split(":", 1)
+        return key, value, 1
+    value = tokens[index + 1] if index + 1 < len(tokens) else None
+    return token, value, 2
+
+
+def _parse_on_off(value: str | None, key: str) -> bool:
+    if value is None:
+        raise ValueError(f"Для {key} нужно on/off")
+    normalized = value.lower()
+    if normalized in {"on", "yes", "true", "1", "да", "вкл"}:
+        return True
+    if normalized in {"off", "no", "false", "0", "нет", "выкл"}:
+        return False
+    raise ValueError(f"Для {key} нужно on/off")
+
+
+def _parse_discovery_subs(
+    tokens: list[str],
+    index: int,
+    first_value: str | None,
+    consumed: int,
+) -> tuple[int | None, int | None, int]:
+    if first_value is None:
+        raise ValueError("Для subs нужно any или пример: subs 100 300")
+    value = first_value.lower()
+    if value in {"any", "all", "любые", "все"}:
+        return None, None, consumed
+    if "-" in value:
+        left, right = value.split("-", 1)
+        return _parse_optional_count(left, "subs"), _parse_optional_count(right, "subs"), consumed
+    if value in {"from", "от"}:
+        if index + consumed >= len(tokens):
+            raise ValueError("Для subs от нужно число: subs от 1000")
+        return _parse_count(tokens[index + consumed], "subs"), None, consumed + 1
+    if value in {"to", "до"}:
+        if index + consumed >= len(tokens):
+            raise ValueError("Для subs до нужно число: subs до 50000")
+        return None, _parse_count(tokens[index + consumed], "subs"), consumed + 1
+    min_subs = _parse_count(first_value, "subs")
+    if index + consumed >= len(tokens):
+        raise ValueError("Для подписчиков нужны два числа или одно: subs 100 300")
+    max_subs = _parse_count(tokens[index + consumed], "subs")
+    return min_subs, max_subs, consumed + 1
+
+
+def _parse_count(value: str, label: str) -> int:
+    normalized = value.lower().replace("_", "").replace(" ", "")
+    if normalized.endswith("k"):
+        normalized = normalized[:-1] + "000"
+    if not normalized.isdigit():
+        raise ValueError(f"{label} должно быть числом")
+    return int(normalized)
+
+
+def _parse_optional_count(value: str, label: str) -> int | None:
+    if value.lower() in {"", "none", "any", "любой"}:
         return None
+    return _parse_count(value, label)
+
+
+def _looks_int(value: str) -> bool:
+    return value.isdigit()
+
+
+def _discovery_option_tokens(options: DiscoveryOptions) -> list[str]:
+    tokens = [
+        f"comments:{_on_off(options.include_comment_links)}",
+        f"profile:{_on_off(options.include_profile_refs)}",
+        f"gifts:{_on_off(options.include_gifts)}",
+    ]
+    if options.min_subscribers is not None or options.max_subscribers is not None:
+        tokens.append(f"subs:{options.min_subscribers or 'none'}:{options.max_subscribers or 'none'}")
+    return tokens
+
+
+def _discovery_sources_label(options: DiscoveryOptions) -> str:
+    labels: list[str] = []
+    if options.include_comment_links:
+        labels.append("комментарии")
+    if options.include_profile_refs:
+        labels.append("профиль")
+    if options.include_gifts:
+        labels.append("подарки")
+    return ", ".join(labels) if labels else "нет"
+
+
+def _discovery_subs_label(options: DiscoveryOptions) -> str:
+    if options.min_subscribers is None and options.max_subscribers is None:
+        return "любые"
+    if options.min_subscribers is None:
+        return f"до {_short_num(options.max_subscribers)}"
+    if options.max_subscribers is None:
+        return f"от {_short_num(options.min_subscribers)}"
+    return f"{_short_num(options.min_subscribers)}-{_short_num(options.max_subscribers)}"
+
+
+def _on_off(value: bool) -> str:
+    return "on" if value else "off"
+
+
+def _scan_results_limit(reports: Sequence[object], settings: AppSettings) -> int:
+    return max(len(reports), settings.top_results)
+
+
+def _callback_int(data: str, prefix: str) -> int | None:
     try:
-        return int(data[len(prefix) :])
+        return int(data.removeprefix(prefix))
     except ValueError:
         return None
 
 
 def _auto_filter_preset_title() -> str:
-    return datetime.now().strftime("Фильтр %d.%m %H:%M:%S")
+    return datetime.now().strftime("Пресет %d.%m %H:%M:%S")
 
 
-async def answer_long(message: Message, text: str, *, reply_markup: InlineKeyboardMarkup | None = None) -> None:
-    chunks = split_text(text)
+async def answer_long(
+    message: Message,
+    text: str,
+    *,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    chunk_size: int = 3800,
+) -> None:
+    chunks = split_text(text, chunk_size=chunk_size)
     for index, chunk in enumerate(chunks):
-        markup = reply_markup if index == len(chunks) - 1 else None
-        await message.answer(chunk, reply_markup=markup)
+        await message.answer(chunk, reply_markup=reply_markup if index == len(chunks) - 1 else None)
 
 
-def split_text(text: str, *, limit: int = 3800) -> list[str]:
-    if len(text) <= limit:
+async def _edit_or_answer(
+    message: Message,
+    text: str,
+    *,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    if hasattr(message, "edit_text"):
+        try:
+            await message.edit_text(text, reply_markup=reply_markup)
+            return
+        except Exception:
+            logging.debug("Could not edit message, falling back to answer", exc_info=True)
+    await message.answer(text, reply_markup=reply_markup)
+
+
+def split_text(text: str, *, chunk_size: int | None = None, limit: int | None = None) -> list[str]:
+    size = limit if limit is not None else (chunk_size if chunk_size is not None else 3800)
+    if len(text) <= size:
         return [text]
 
     chunks: list[str] = []
-    current = ""
+    current: list[str] = []
+    current_len = 0
     for block in text.split("\n\n"):
-        if len(block) > limit:
+        block_len = len(block) + (2 if current else 0)
+        if block_len > size:
             if current:
-                chunks.append(current)
-                current = ""
-            chunks.extend(_split_long_block(block, limit=limit))
+                chunks.append("\n\n".join(current))
+                current = []
+                current_len = 0
+            chunks.extend(_split_long_block(block, chunk_size=size))
             continue
-        candidate = f"{current}\n\n{block}" if current else block
-        if len(candidate) <= limit:
-            current = candidate
-            continue
-        if current:
-            chunks.append(current)
-        current = block
+
+        if current and current_len + block_len > size:
+            chunks.append("\n\n".join(current))
+            current = [block]
+            current_len = len(block)
+        else:
+            current.append(block)
+            current_len += block_len
+
     if current:
-        chunks.append(current)
+        chunks.append("\n\n".join(current))
     return chunks
 
 
-def _split_long_block(block: str, *, limit: int) -> list[str]:
+def _split_long_block(block: str, *, chunk_size: int) -> list[str]:
+    lines = block.splitlines()
     chunks: list[str] = []
-    current = ""
-    for line in block.splitlines():
-        if len(line) > limit:
+    current: list[str] = []
+    current_len = 0
+    for line in lines:
+        line_len = len(line) + (1 if current else 0)
+        if line_len > chunk_size:
             if current:
-                chunks.append(current)
-                current = ""
-            chunks.extend(line[index : index + limit] for index in range(0, len(line), limit))
+                chunks.append("\n".join(current))
+                current = []
+                current_len = 0
+            chunks.extend(line[i : i + chunk_size] for i in range(0, len(line), chunk_size))
             continue
-        candidate = f"{current}\n{line}" if current else line
-        if len(candidate) <= limit:
-            current = candidate
-            continue
-        chunks.append(current)
-        current = line
+
+        if current and current_len + line_len > chunk_size:
+            chunks.append("\n".join(current))
+            current = [line]
+            current_len = len(line)
+        else:
+            current.append(line)
+            current_len += line_len
+
     if current:
-        chunks.append(current)
+        chunks.append("\n".join(current))
     return chunks
+
+
+def format_main_menu() -> str:
+    return (
+        "🚀 SwiftPull Parser\n\n"
+        "Поиск и аудит активных Telegram-каналов под закуп рекламы.\n\n"
+        "• 🧻 Парсинг — пресеты, свой поиск, discovery, check\n"
+        "• 💾 База — результаты, история, CSV\n"
+        "• ⚙️ Фильтры — подписчики, ЦА, score и сортировка\n\n"
+        "Подсказка: /find ключи, /discover @channel 200, /check @channel"
+    )
+
+
+def format_parsing_menu() -> str:
+    return (
+        "🧻 Парсинг\n\n"
+        "Выбери сценарий:\n"
+        "• пресет по вертикали — сразу запускает поиск\n"
+        "• свой поиск — вводишь ключевые слова\n"
+        "• discovery — каналы из комментариев донора\n"
+        "• check — карточка одного канала"
+    )
+
+
+def format_database_menu(*, has_history: bool, has_results: bool) -> str:
+    history = "есть" if has_history else "пока пусто"
+    results = "есть" if has_results else "пока пусто"
+    return (
+        "💾 База данных\n\n"
+        f"Последние результаты: {results}\n"
+        f"История сканов: {history}\n\n"
+        "Можно открыть топ каналов, историю или скачать CSV."
+    )
+
+
+def format_accounts_menu(session_path: object) -> str:
+    return (
+        "🧾 Мои аккаунты\n\n"
+        "Парсер ходит в Telegram через пользовательскую сессию Telethon.\n"
+        f"Сессия: `{session_path}`\n\n"
+        "Чтобы сменить аккаунт — перелогинься через login CLI."
+    )
+
+
+def format_subscription_menu() -> str:
+    return (
+        "💎 Подписка\n\n"
+        "Пока все функции открыты без оплаты:\n"
+        "поиск, discovery, фильтры, пресеты и CSV-экспорт.\n\n"
+        "Тарифы появятся здесь позже."
+    )
+
+
+def format_help() -> str:
+    return (
+        "🎧 Поддержка и команды\n\n"
+        "🔎 Поиск\n"
+        "/find запрос1, запрос2\n"
+        "/presets — готовые вертикали\n"
+        "/discover @channel 200\n"
+        "/discover @channel 200 comments on profile on gifts off subs 100 300\n"
+        "/check @channel\n\n"
+        "⚙️ Фильтры\n"
+        "/filters — панель\n"
+        "/set — точная настройка\n"
+        "/reset — сброс\n"
+        "/savefilter Название — пресет фильтров\n"
+        "/filterpresets — мои пресеты\n\n"
+        "💾 База\n"
+        "/latest · /history · /export\n\n"
+        f"{SET_HELP}"
+    )
+
+
+def format_scan_progress_card(
+    *,
+    title: str,
+    progress_label: str,
+    processed: int,
+    total: int,
+    found: int,
+    started_at: datetime,
+    details: str | None = None,
+    done: bool = False,
+) -> str:
+    elapsed = _elapsed_seconds(started_at)
+    rate = processed / elapsed if elapsed > 0 else 0.0
+    status = f"{title} · готово" if done else title
+    lines = [
+        status,
+        "",
+        _progress_bar(processed, total),
+        f"Прогресс: {processed}/{total} {progress_label.lower()}",
+        f"Найдено каналов: {found}",
+        f"Время: {_format_compact_duration(elapsed)} ({rate:.1f} шт./с)",
+        f"Осталось примерно: {_format_eta(processed, total, elapsed)}",
+    ]
+    if details:
+        lines.extend(["", details])
+    return "\n".join(lines)
+
+
+def format_discovery_progress_card(
+    *,
+    identifier: str,
+    post_limit: int,
+    stats: dict[str, int],
+    started_at: datetime,
+    discovery_options: DiscoveryOptions,
+    gift_limit: int | None,
+    done: bool = False,
+) -> str:
+    processed = int(stats.get("posts_processed", 0))
+    posts_seen = int(stats.get("posts_seen", 0))
+    total = posts_seen if posts_seen > 0 else max(post_limit, 1)
+    found = int(stats.get("reports_found", 0))
+    candidates = (
+        int(stats.get("comment_refs", 0))
+        + int(stats.get("bio_refs", 0))
+        + int(stats.get("personal_channel_refs", 0))
+        + int(stats.get("gift_refs", 0))
+        + int(stats.get("channel_commenter_refs", 0))
+    )
+    inspected = int(stats.get("inspected_channels", 0))
+    elapsed = _elapsed_seconds(started_at)
+    rate = processed / elapsed if elapsed > 0 else 0.0
+    if done:
+        title = "🔗 Discovery · готово"
+    elif int(stats.get("collection_finished_early", 0)):
+        title = "🔗 Discovery · обход постов завершён, проверяю кандидатов"
+    else:
+        title = "🔗 Идёт discovery"
+    return "\n".join(
+        [
+            title,
+            "",
+            _progress_bar(processed, total),
+            f"Прогресс: {processed}/{total} постов",
+            f"Найдено каналов: {found}",
+            f"Время: {_format_compact_duration(elapsed)} ({rate:.1f} пост./с)",
+            f"Осталось примерно: {_format_eta(processed, total, elapsed)}",
+            "",
+            f"Источник: {identifier}",
+            f"Источники: {_discovery_sources_label(discovery_options)}",
+            f"ПДП: {_discovery_subs_label(discovery_options)}",
+            f"Подарки: {_enabled_label(bool(gift_limit))}",
+            f"Кандидаты: {candidates}; проверено: {inspected}",
+            "«Завершить досрочно» = стоп постов, дальше check кандидатов.",
+            "«Отмена» = остановить всё.",
+        ]
+    )
+
+
+def _progress_bar(processed: int, total: int, *, width: int = 12) -> str:
+    if total <= 0:
+        filled = 0
+    else:
+        filled = min(width, max(0, round(width * processed / total)))
+    empty = width - filled
+    percent = 0 if total <= 0 else min(100, int(100 * processed / total))
+    return f"[{'█' * filled}{'░' * empty}] {percent}%"
+
+
+def _elapsed_seconds(started_at: datetime) -> float:
+    now = datetime.now(started_at.tzinfo or timezone.utc)
+    return max(0.001, (now - started_at).total_seconds())
+
+
+def _format_eta(processed: int, total: int, elapsed: float) -> str:
+    if processed <= 0 or total <= processed:
+        return "—"
+    remaining = total - processed
+    rate = processed / elapsed
+    if rate <= 0:
+        return "—"
+    return _format_compact_duration(remaining / rate)
+
+
+def _format_compact_duration(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    minutes, secs = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} ч. {minutes} м. {secs} с."
+    if minutes:
+        return f"{minutes} м. {secs} с."
+    return f"{secs} с."
+
+
+def _enabled_label(value: bool) -> str:
+    return "да" if value else "нет"
 
 
 def format_filter_dashboard(filters: SearchFilters) -> str:
     return (
         "Фильтры поиска\n\n"
         f"Подписчики: {_subs_label(filters)}\n"
-        f"Последний пост: {_fresh_label(filters)}\n"
+        f"Посты: {_fresh_label(filters)}\n"
         f"Просмотры: {_views_label(filters)}\n"
         f"Score: {_score_label(filters)}\n"
-        f"Аудитория: {_audience_label(filters)}\n"
+        f"Тип: {_channel_kind_label(filters)}\n"
+        f"ЦА: {_audience_label(filters)}\n"
         f"Возраст: {_age_label(filters)}\n"
-        f"Сортировка: {_sort_label(filters)}"
+        f"Сортировка: {_sort_label(filters)}\n\n"
+        "Нажми раздел, чтобы изменить значение."
     )
 
 
 def format_filter_section(section: str, filters: SearchFilters) -> str:
-    titles = {
-        "subs": ("Подписчики", _subs_label(filters)),
-        "fresh": ("Свежесть постов", _fresh_label(filters)),
-        "views": ("Средние просмотры", _views_label(filters)),
-        "score": ("Активность", _score_label(filters)),
-        "audience": ("Аудитория", _audience_label(filters)),
-        "age": ("Возраст", _age_label(filters)),
-        "sort": ("Сортировка", _sort_label(filters)),
+    labels = {
+        "subs": ("👥 Подписчики", _subs_label(filters)),
+        "fresh": ("⏱ Свежесть поста", _fresh_label(filters)),
+        "views": ("👁 Средние просмотры", _views_label(filters)),
+        "score": ("⚡ Score активности", _score_label(filters)),
+        "kind": ("🏷 Тип канала", _channel_kind_label(filters)),
+        "audience": ("🎯 Аудитория", _audience_label(filters)),
+        "age": ("📅 Возраст", _age_label(filters)),
+        "sort": ("↕️ Сортировка", _sort_label(filters)),
     }
-    try:
-        title, value = titles[section]
-    except KeyError as exc:
-        raise ValueError(f"Unknown filter section: {section}") from exc
-    return f"{title}\n\nСейчас: {value}"
+    title, value = labels.get(section, ("Фильтр", "-"))
+    if section not in labels:
+        raise ValueError(f"Unknown filter section: {section}")
+    return f"{title}\n\nСейчас: {value}\n\nВыбери новое значение:"
 
 
 def main_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="Готовый поиск: финансы + женская ЦА", callback_data="preset:finance_female")
-    builder.button(text="Все готовые поиски", callback_data="presets")
-    builder.button(text="Настроить фильтры", callback_data="filters")
-    builder.button(text="Мои фильтр-пресеты", callback_data="filterpresets")
-    builder.button(text="Последние результаты", callback_data="latest")
-    builder.button(text="История", callback_data="history")
+    builder.button(text="🧻 Парсинг", callback_data="parsing")
+    builder.button(text="💾 База данных", callback_data="database")
+    builder.button(text="🧾 Мои аккаунты", callback_data="accounts")
+    builder.button(text="💎 Подписка", callback_data="subscription")
+    builder.button(text="🎧 Поддержка", callback_data="support")
+    builder.adjust(1, 2, 2)
+    return builder.as_markup()
+
+
+def parsing_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🧩 Пресеты запросов", callback_data="presets")
+    builder.button(text="🔎 Свой поиск", callback_data="prompt:find")
+    builder.button(text="🔗 Discovery", callback_data="prompt:discover")
+    builder.button(text="🧪 Check канала", callback_data="prompt:check")
+    builder.button(text="⚙️ Фильтры", callback_data="filters")
+    builder.button(text="💾 Мои пресеты фильтров", callback_data="filterpresets")
+    builder.button(text="🏠 В меню", callback_data="menu:main")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -766,8 +1539,45 @@ def presets_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for preset in QUERY_PRESETS.values():
         builder.button(text=preset.title, callback_data=f"preset:{preset.key}")
-    builder.button(text="Фильтры", callback_data="filters")
-    builder.button(text="Мои фильтр-пресеты", callback_data="filterpresets")
+    builder.button(text="⚙️ Фильтры", callback_data="filters")
+    builder.button(text="💾 Мои пресеты фильтров", callback_data="filterpresets")
+    builder.button(text="⬅️ К парсингу", callback_data="parsing")
+    builder.button(text="🏠 В меню", callback_data="menu:main")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def database_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📋 Последние результаты", callback_data="latest")
+    builder.button(text="🗂 История", callback_data="history")
+    builder.button(text="📥 Скачать CSV", callback_data="export:last")
+    builder.button(text="🏠 В меню", callback_data="menu:main")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def accounts_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⚙️ Фильтры", callback_data="filters")
+    builder.button(text="💾 Мои пресеты фильтров", callback_data="filterpresets")
+    builder.button(text="🏠 В меню", callback_data="menu:main")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def support_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🧻 Парсинг", callback_data="parsing")
+    builder.button(text="⚙️ Фильтры", callback_data="filters")
+    builder.button(text="🏠 В меню", callback_data="menu:main")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def cancel_input_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🚫 Отмена", callback_data="input:cancel")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -778,138 +1588,146 @@ def filters_keyboard(filters: SearchFilters) -> InlineKeyboardMarkup:
     builder.button(text=f"Посты: {_fresh_label(filters)}", callback_data="filters:section:fresh")
     builder.button(text=f"Просмотры: {_views_label(filters)}", callback_data="filters:section:views")
     builder.button(text=f"Score: {_score_label(filters)}", callback_data="filters:section:score")
+    builder.button(text=f"Тип: {_channel_kind_label(filters)}", callback_data="filters:section:kind")
     builder.button(text=f"ЦА: {_audience_label(filters)}", callback_data="filters:section:audience")
     builder.button(text=f"Возраст: {_age_label(filters)}", callback_data="filters:section:age")
     builder.button(text=f"Сортировка: {_sort_label(filters)}", callback_data="filters:section:sort")
-    builder.button(text="Мои пресеты фильтров", callback_data="filterpresets")
-    builder.button(text="Сохранить как пресет", callback_data="filterpreset:save:named")
-    builder.button(text="Сбросить фильтры", callback_data="filters:reset")
-    builder.adjust(2, 2, 2, 1, 2, 1)
+    builder.button(text="💾 Мои пресеты фильтров", callback_data="filterpresets")
+    builder.button(text="📌 Сохранить как пресет", callback_data="filterpreset:save:named")
+    builder.button(text="♻️ Сбросить фильтры", callback_data="filters:reset")
+    builder.adjust(2, 2, 2, 2, 1, 2)
     return builder.as_markup()
 
 
 def filter_section_keyboard(section: str, filters: SearchFilters) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    adjust_pattern: tuple[int, ...]
     if section == "subs":
-        _add_option_buttons(
-            builder,
-            [
-                ("100-300", "subs:100:300"),
-                ("300-1k", "subs:300:1000"),
-                ("1k-5k", "subs:1000:5000"),
-                ("5k-20k", "subs:5000:20000"),
-                ("От 20k", "subs:20000:none"),
-                ("Любые", "subs:none:none"),
-            ],
-        )
-        adjust_pattern = (2, 2, 2, 1)
+        options = [
+            ("100-300", "subs:100:300"),
+            ("300-1k", "subs:300:1000"),
+            ("1k-5k", "subs:1000:5000"),
+            ("5k-20k", "subs:5000:20000"),
+            ("20k-50k", "subs:20000:50000"),
+            ("От 50k", "subs:50000:none"),
+            ("Любые", "subs:none:none"),
+        ]
+        selected = {
+            "subs:100:300": filters.min_subscribers == 100 and filters.max_subscribers == 300,
+            "subs:300:1000": filters.min_subscribers == 300 and filters.max_subscribers == 1000,
+            "subs:1000:5000": filters.min_subscribers == 1000 and filters.max_subscribers == 5000,
+            "subs:5000:20000": filters.min_subscribers == 5000 and filters.max_subscribers == 20000,
+            "subs:20000:50000": filters.min_subscribers == 20000 and filters.max_subscribers == 50000,
+            "subs:50000:none": filters.min_subscribers == 50000 and filters.max_subscribers is None,
+            "subs:none:none": filters.min_subscribers is None and filters.max_subscribers is None,
+        }
     elif section == "fresh":
-        _add_option_buttons(
-            builder,
-            [
-                ("<= 1 день", "active:1"),
-                ("<= 3 дня", "active:3"),
-                ("<= 7 дней", "active:7"),
-                ("<= 14 дней", "active:14"),
-                ("<= 30 дней", "active:30"),
-            ],
-        )
-        adjust_pattern = (2, 2, 1, 1)
+        options = [
+            ("<= 1 день", "active:1"),
+            ("<= 3 дня", "active:3"),
+            ("<= 7 дней", "active:7"),
+            ("<= 14 дней", "active:14"),
+            ("<= 30 дней", "active:30"),
+        ]
+        selected = {f"active:{days}": filters.max_last_post_days == days for days in (1, 3, 7, 14, 30)}
     elif section == "views":
-        _add_option_buttons(
-            builder,
-            [
-                ("Любые", "views:none"),
-                (">= 50", "views:50"),
-                (">= 100", "views:100"),
-                (">= 500", "views:500"),
-                (">= 1000", "views:1000"),
-            ],
-        )
-        adjust_pattern = (2, 2, 1, 1)
+        options = [
+            ("Любые", "views:none"),
+            ("от 100", "views:100"),
+            ("от 500", "views:500"),
+            ("от 1k", "views:1000"),
+            ("от 5k", "views:5000"),
+            ("от 10k", "views:10000"),
+        ]
+        selected = {
+            "views:none": filters.min_avg_views is None,
+            "views:100": filters.min_avg_views == 100,
+            "views:500": filters.min_avg_views == 500,
+            "views:1000": filters.min_avg_views == 1000,
+            "views:5000": filters.min_avg_views == 5000,
+            "views:10000": filters.min_avg_views == 10000,
+        }
     elif section == "score":
-        _add_option_buttons(
-            builder,
-            [
-                (">= 0", "scoremin:0"),
-                (">= 25", "scoremin:25"),
-                (">= 35", "scoremin:35"),
-                (">= 50", "scoremin:50"),
-                (">= 70", "scoremin:70"),
-            ],
-        )
-        adjust_pattern = (2, 2, 1, 1)
+        options = [
+            (">= 0", "scoremin:0"),
+            (">= 20", "scoremin:20"),
+            (">= 35", "scoremin:35"),
+            (">= 50", "scoremin:50"),
+            (">= 70", "scoremin:70"),
+        ]
+        selected = {
+            f"scoremin:{value:g}": filters.min_activity_score == float(value)
+            for value in (0, 20, 35, 50, 70)
+        }
+    elif section == "kind":
+        options = [
+            ("Тематические", "kind:thematic"),
+            ("Коммерческие", "kind:commercial"),
+            ("Любые", "kind:any"),
+        ]
+        selected = {f"kind:{value}": filters.channel_kind == value for value in VALID_CHANNEL_KINDS}
     elif section == "audience":
-        _add_option_buttons(
-            builder,
-            [
-                ("Женская", "audience:female"),
-                ("Мужская", "audience:male"),
-                ("Любая", "audience:any"),
-            ],
-        )
-        adjust_pattern = (2, 1, 1)
+        options = [
+            ("Женская", "audience:female"),
+            ("Мужская", "audience:male"),
+            ("Любая", "audience:any"),
+        ]
+        selected = {
+            "audience:female": filters.audience_bias == "female",
+            "audience:male": filters.audience_bias == "male",
+            "audience:any": filters.audience_bias == "any",
+        }
     elif section == "age":
-        _add_option_buttons(
-            builder,
-            [
-                ("Любой", "age:any"),
-                ("14-17", "age:14-17"),
-                ("18-24", "age:18-24"),
-                ("25-34", "age:25-34"),
-                ("35+", "age:35+"),
-            ],
-        )
-        adjust_pattern = (2, 2, 1, 1)
+        ages = sorted(VALID_AGES)
+        options = [("Любой" if age == "any" else age, f"age:{age}") for age in ages]
+        selected = {f"age:{age}": filters.age_group == age for age in ages}
     elif section == "sort":
-        _add_option_buttons(
-            builder,
-            [
-                ("Score", "sort:score"),
-                ("Просмотры", "sort:views"),
-                ("Реакции", "sort:reactions"),
-                ("Комментарии", "sort:comments"),
-                ("Подписчики", "sort:subscribers"),
-                ("Свежесть", "sort:fresh"),
-            ],
-        )
-        adjust_pattern = (2, 2, 2, 1)
+        options = [
+            ("Score", "sort:score"),
+            ("Просмотры", "sort:views"),
+            ("Реакции", "sort:reactions"),
+            ("Комменты", "sort:comments"),
+            ("Подписчики", "sort:subscribers"),
+            ("Свежесть", "sort:fresh"),
+        ]
+        selected = {f"sort:{value}": filters.sort_by == value for value in VALID_SORTS}
     else:
-        raise ValueError(f"Unknown filter section: {section}")
+        options = []
+        selected = {}
+
+    for title, callback_data in options:
+        mark = "✓ " if selected.get(callback_data) else ""
+        # Keep exact labels for tests when nothing is selected on that option
+        builder.button(text=f"{mark}{title}", callback_data=callback_data)
     builder.button(text="К фильтрам", callback_data="filters:dashboard")
-    builder.adjust(*adjust_pattern)
+    builder.adjust(2)
     return builder.as_markup()
 
 
 def filter_presets_keyboard(presets: list[FilterPreset]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="Сохранить с названием", callback_data="filterpreset:save:named")
-    builder.button(text="Быстро сохранить", callback_data="filterpreset:save:auto")
+    builder.button(text="📌 Сохранить с названием", callback_data="filterpreset:save:named")
+    builder.button(text="⚡ Быстро сохранить", callback_data="filterpreset:save:auto")
     for preset in presets:
         title = _short_button_title(preset.title)
-        builder.button(text=f"Применить: {title}", callback_data=f"filterpreset:apply:{preset.preset_id}")
-        builder.button(text=f"Удалить: {title}", callback_data=f"filterpreset:delete:{preset.preset_id}")
-    builder.button(text="Фильтры", callback_data="filters")
-    builder.adjust(1)
+        builder.button(text=f"✅ {title}", callback_data=f"filterpreset:apply:{preset.preset_id}")
+        builder.button(text=f"🗑 {title}", callback_data=f"filterpreset:delete:{preset.preset_id}")
+    builder.button(text="⚙️ Фильтры", callback_data="filters")
+    builder.button(text="🏠 В меню", callback_data="menu:main")
+    builder.adjust(2 if presets else 1)
     return builder.as_markup()
 
 
 def filter_preset_name_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="Отменить", callback_data="filterpreset:save:cancel")
+    builder.button(text="🚫 Отменить", callback_data="filterpreset:save:cancel")
+    builder.adjust(1)
     return builder.as_markup()
 
 
-def _add_option_buttons(builder: InlineKeyboardBuilder, options: list[tuple[str, str]]) -> None:
-    for text, callback_data in options:
-        builder.button(text=text, callback_data=callback_data)
-
-
-def _short_button_title(title: str, *, limit: int = 34) -> str:
+def _short_button_title(title: str, *, limit: int = 26) -> str:
     if len(title) <= limit:
         return title
-    return title[: limit - 3].rstrip() + "..."
+    return f"{title[: limit - 1]}…"
 
 
 def _subs_label(filters: SearchFilters) -> str:
@@ -929,20 +1747,27 @@ def _fresh_label(filters: SearchFilters) -> str:
 def _views_label(filters: SearchFilters) -> str:
     if filters.min_avg_views is None:
         return "любые"
-    return f">= {_short_num(filters.min_avg_views)}"
+    return f"от {_short_num(filters.min_avg_views)}"
 
 
 def _score_label(filters: SearchFilters) -> str:
-    return f">= {filters.min_activity_score:.0f}"
+    return f">= {filters.min_activity_score:g}"
+
+
+def _channel_kind_label(filters: SearchFilters) -> str:
+    return {
+        "thematic": "тематические",
+        "commercial": "коммерческие",
+        "any": "любые",
+    }.get(filters.channel_kind, filters.channel_kind)
 
 
 def _audience_label(filters: SearchFilters) -> str:
-    labels = {
+    return {
         "female": "женская",
         "male": "мужская",
         "any": "любая",
-    }
-    return labels.get(filters.audience_bias, filters.audience_bias)
+    }.get(filters.audience_bias, filters.audience_bias)
 
 
 def _age_label(filters: SearchFilters) -> str:
@@ -950,43 +1775,51 @@ def _age_label(filters: SearchFilters) -> str:
 
 
 def _sort_label(filters: SearchFilters) -> str:
-    labels = {
-        "score": "score",
-        "views": "просмотры",
-        "reactions": "реакции",
-        "comments": "комменты",
-        "subscribers": "подписчики",
-        "fresh": "свежесть",
-    }
-    return labels.get(filters.sort_by, filters.sort_by)
+    return filters.sort_by
 
 
-def _short_num(value: int | None) -> str:
-    if value is None:
-        return "?"
-    if value >= 1000 and value % 1000 == 0:
-        return f"{value // 1000}k"
-    return str(value)
+def scan_cancel_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💾 Завершить досрочно", callback_data="scan:finish")
+    builder.button(text="🚫 Отмена", callback_data="scan:cancel")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+# Keep aliases for clarity in discovery progress copy.
+def discovery_control_keyboard() -> InlineKeyboardMarkup:
+    return scan_cancel_keyboard()
 
 
 def results_keyboard(has_results: bool) -> InlineKeyboardMarkup | None:
-    if not has_results:
-        return main_keyboard()
     builder = InlineKeyboardBuilder()
-    builder.button(text="Экспорт CSV", callback_data="export:last")
-    builder.button(text="История", callback_data="history")
-    builder.button(text="Фильтры", callback_data="filters")
-    builder.button(text="Новый поиск по финансам", callback_data="preset:finance_female")
+    if has_results:
+        builder.button(text="📥 Скачать CSV", callback_data="export:last")
+    builder.button(text="⚙️ Фильтры", callback_data="filters")
+    builder.button(text="🧻 Парсинг", callback_data="parsing")
+    builder.button(text="🗂 История", callback_data="history")
+    builder.button(text="🏠 В меню", callback_data="menu:main")
     builder.adjust(1)
     return builder.as_markup()
 
 
 def history_keyboard(has_scans: bool) -> InlineKeyboardMarkup | None:
-    if not has_scans:
-        return main_keyboard()
     builder = InlineKeyboardBuilder()
-    builder.button(text="Экспорт последнего CSV", callback_data="export:last")
-    builder.button(text="Последние результаты", callback_data="latest")
-    builder.button(text="Фильтры", callback_data="filters")
+    if has_scans:
+        builder.button(text="📥 Скачать последний CSV", callback_data="export:last")
+        builder.button(text="📋 Последние результаты", callback_data="latest")
+    builder.button(text="🧻 Парсинг", callback_data="parsing")
+    builder.button(text="⚙️ Фильтры", callback_data="filters")
+    builder.button(text="🏠 В меню", callback_data="menu:main")
     builder.adjust(1)
     return builder.as_markup()
+
+
+def _short_num(value: int | None) -> str:
+    if value is None:
+        return "?"
+    if abs(value) >= 1_000_000:
+        return f"{value / 1_000_000:g}m"
+    if abs(value) >= 1_000:
+        return f"{value // 1_000}k" if value % 1_000 == 0 else f"{value / 1_000:.1f}k"
+    return str(value)

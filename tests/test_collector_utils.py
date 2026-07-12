@@ -6,13 +6,19 @@ from types import SimpleNamespace
 import pytest
 
 from ChannelsParser.collector import (
+    CandidateSource,
     TelegramChannelCollector,
     _comment_count,
+    _collect_gift_channel_refs,
+    _collect_personal_channel_ref,
+    _peer_id_value,
     _reaction_count,
     _views,
+    extract_channel_references,
     normalize_channel_identifier,
 )
 from ChannelsParser.models import SearchFilters
+from telethon import types
 
 
 @pytest.mark.parametrize(
@@ -56,6 +62,112 @@ def test_message_counters_tolerate_unexpected_values() -> None:
     assert _comment_count(message) == 0  # type: ignore
 
 
+def test_extract_channel_references_reads_links_and_mentions() -> None:
+    assert extract_channel_references("каналы: https://t.me/fashion_shop и @brand_agency") == [
+        "fashion_shop",
+        "brand_agency",
+    ]
+
+
+def test_collect_personal_channel_ref_reads_user_full_chats() -> None:
+    candidates: dict[str, str] = {}
+    full = SimpleNamespace(
+        full_user=SimpleNamespace(personal_channel_id=123),
+        chats=[
+            types.Channel(
+                id=123,
+                title="Personal brand",
+                photo=types.ChatPhotoEmpty(),
+                date=None,
+                broadcast=True,
+                username="personal_brand",
+            )
+        ],
+    )
+
+    assert _collect_personal_channel_ref(
+        candidates,
+        full,
+        owner_username="owner_user",
+        owner_display_name="Owner Name",
+    ) == 1
+    assert candidates["personal_brand"].owner_username == "owner_user"
+    assert candidates["personal_brand"].owner_display_name == "Owner Name"
+    assert candidates == {"personal_brand": "личный канал профиля"}
+
+
+def test_collect_gift_channel_refs_reads_channel_gifters() -> None:
+    candidates: dict[str, str] = {}
+    saved_gifts = SimpleNamespace(
+        gifts=[
+            SimpleNamespace(from_id=types.PeerChannel(channel_id=123)),
+            SimpleNamespace(from_id=types.PeerUser(user_id=456)),
+        ],
+        chats=[
+            types.Channel(
+                id=123,
+                title="Gift sender",
+                photo=types.ChatPhotoEmpty(),
+                date=None,
+                broadcast=True,
+                username="gift_sender",
+            )
+        ],
+    )
+
+    assert _collect_gift_channel_refs(candidates, saved_gifts) == 1
+    assert candidates == {"gift_sender": "подарок от канала"}
+
+
+def test_collect_sender_refs_checks_gifts_without_profile_refs() -> None:
+    async def scenario() -> None:
+        collector = GiftOnlyCollector()
+        candidates: dict[str, CandidateSource] = {}
+        stats = {
+            "profiles_seen": 0,
+            "profiles_skipped_by_limit": 0,
+            "comment_refs": 0,
+            "bio_refs": 0,
+            "personal_channel_refs": 0,
+            "gift_profiles_checked": 0,
+            "gift_fetch_errors": 0,
+            "gift_refs": 0,
+            "channel_commenter_refs": 0,
+        }
+        message = SimpleNamespace(
+            sender=types.User(
+                id=42,
+                is_self=False,
+                access_hash=123,
+                first_name="Owner",
+                username="owner_user",
+            ),
+            message="",
+        )
+
+        await collector._collect_sender_refs(
+            candidates,
+            message,  # type: ignore[arg-type]
+            seen_sender_ids=set(),
+            limit=10,
+            profile_limit=0,
+            gift_limit=5,
+            include_comment_links=False,
+            include_profile_refs=False,
+            stats=stats,
+        )
+
+        assert stats["profiles_seen"] == 0
+        assert stats["gift_refs"] == 1
+        assert candidates == {"gift_sender": "gift source"}
+
+    asyncio.run(scenario())
+
+
+def test_peer_id_value_reads_channel_peer() -> None:
+    assert _peer_id_value(types.PeerChannel(channel_id=123)) == 123
+
+
 def test_search_channels_skips_unexpected_channel_errors() -> None:
     async def scenario() -> None:
         collector = BrokenCollector()
@@ -78,3 +190,12 @@ class BrokenCollector(TelegramChannelCollector):
 
     async def inspect_channel(self, *args, **kwargs):
         raise RuntimeError("boom")
+
+
+class GiftOnlyCollector(TelegramChannelCollector):
+    def __init__(self) -> None:
+        self._settings = SimpleNamespace(flood_sleep_limit_seconds=0)
+
+    async def _collect_gift_refs(self, candidates, sender, *, gift_limit, stats):
+        candidates["gift_sender"] = CandidateSource("gift source")
+        return 1

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from ChannelsParser.cli import _validate_search_args, parse_cli_queries
+from ChannelsParser.cli import _validate_discover_args, _validate_search_args, build_parser, parse_cli_queries
 from ChannelsParser.commands import apply_set_command, parse_queries
 from ChannelsParser.models import SearchFilters
 
@@ -24,6 +24,17 @@ def test_parse_cli_queries_keeps_space_arguments_separate() -> None:
     ]
 
 
+def test_cli_discover_defaults_to_any_active_channels() -> None:
+    args = build_parser().parse_args(["discover", "@source"])
+
+    assert args.subs_min == 0
+    assert args.subs_max == 0
+    assert args.channel_kind == "any"
+    assert args.audience == "any"
+    assert args.score_min == 35
+    assert args.gift_limit == 10
+
+
 def test_apply_set_command_updates_subscribers_and_views() -> None:
     filters, _ = apply_set_command(SearchFilters(), "subs 100 300")
     assert filters.min_subscribers == 100
@@ -31,6 +42,12 @@ def test_apply_set_command_updates_subscribers_and_views() -> None:
 
     filters, _ = apply_set_command(filters, "views any")
     assert filters.min_avg_views is None
+
+
+def test_apply_set_command_updates_channel_kind() -> None:
+    filters, _ = apply_set_command(SearchFilters(), "type commercial")
+
+    assert filters.channel_kind == "commercial"
 
 
 def test_apply_set_command_rejects_bad_score() -> None:
@@ -49,3 +66,39 @@ def test_cli_validation_rejects_invalid_ranges() -> None:
 
     with pytest.raises(ValueError):
         _validate_search_args(Args())  # type: ignore
+
+
+def test_cli_discover_validation_rejects_bad_post_limit() -> None:
+    class Args:
+        subs_min = 100
+        subs_max = 1000
+        days = 7
+        views_min = None
+        score_min = 35
+        limit = 10
+        posts = 0
+        comments_per_post = 100
+        profile_limit = 500
+        candidate_limit = 300
+        gift_limit = 10
+
+    with pytest.raises(ValueError):
+        _validate_discover_args(Args())  # type: ignore
+
+
+def test_cli_discover_validation_rejects_negative_gift_limit() -> None:
+    class Args:
+        subs_min = 100
+        subs_max = 1000
+        days = 7
+        views_min = None
+        score_min = 35
+        limit = 10
+        posts = 100
+        comments_per_post = 100
+        profile_limit = 500
+        candidate_limit = 300
+        gift_limit = -1
+
+    with pytest.raises(ValueError):
+        _validate_discover_args(Args())  # type: ignore

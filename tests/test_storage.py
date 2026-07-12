@@ -36,6 +36,8 @@ def test_storage_persists_filters_scans_and_reports(tmp_path) -> None:
 
     latest = storage.latest_reports(user_id=42)
     assert len(latest) == 1
+    assert latest[0].owner_username == "owner_user"
+    assert latest[0].owner_display_name == "Owner Name"
     assert latest[0].title == "Деньги в декрете"
     assert storage.latest_scan_id(user_id=42) == "empty-scan"
     assert storage.latest_scan_id(user_id=42, require_reports=True) == scan_id
@@ -172,4 +174,6 @@ def _sample_report() -> ChannelReport:
         audience=estimate_audience("Деньги в декрете", "Финансовая грамотность для мам"),
         matched_queries=["семейный бюджет"],
         collected_at=now,
+        owner_username="owner_user",
+        owner_display_name="Owner Name",
     )
