@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import asdict, fields
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ChannelsParser.models import AudienceEstimate, ChannelReport, FilterPreset, ScanRecord, SearchFilters
@@ -120,6 +120,119 @@ class ChannelStorage:
                 ON user_filter_presets(user_id, updated_at DESC)
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS allowed_users (
+                    user_id INTEGER PRIMARY KEY,
+                    granted_by INTEGER,
+                    note TEXT,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT
+                )
+                """
+            )
+            _ensure_column(connection, "allowed_users", "expires_at", "TEXT")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_allowed_users_created ON allowed_users(created_at DESC)"
+            )
+
+    def is_user_allowed(self, user_id: int) -> bool:
+        now = datetime.now(timezone.utc)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT expires_at FROM allowed_users WHERE user_id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+            if not row:
+                return False
+            expires_at = _parse_dt(row["expires_at"])
+            if expires_at is not None and expires_at <= now:
+                connection.execute("DELETE FROM allowed_users WHERE user_id = ?", (user_id,))
+                return False
+        return True
+
+    def grant_access(
+        self,
+        user_id: int,
+        *,
+        granted_by: int | None = None,
+        note: str | None = None,
+        days: int | None = None,
+    ) -> str:
+        """Grant or renew access.
+
+        Returns:
+            "created" — new row
+            "updated" — existing row updated (term / grantor)
+        """
+        if days is not None and (days < 1 or days > 3650):
+            raise ValueError("Срок доступа: от 1 до 3650 дней")
+        now = datetime.now(timezone.utc)
+        now_s = _dt(now)
+        expires_at = None if days is None else _dt(now + timedelta(days=days))
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT 1 FROM allowed_users WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if existing:
+                connection.execute(
+                    """
+                    UPDATE allowed_users
+                    SET granted_by = ?, note = COALESCE(?, note), expires_at = ?, created_at = ?
+                    WHERE user_id = ?
+                    """,
+                    (granted_by, note, expires_at, now_s, user_id),
+                )
+                return "updated"
+            connection.execute(
+                """
+                INSERT INTO allowed_users(user_id, granted_by, note, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (user_id, granted_by, note, now_s, expires_at),
+            )
+        return "created"
+
+    def revoke_access(self, user_id: int) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM allowed_users WHERE user_id = ?",
+                (user_id,),
+            )
+        return cursor.rowcount > 0
+
+    def list_allowed_users(
+        self, *, limit: int = 200
+    ) -> list[tuple[int, int | None, datetime, datetime | None]]:
+        """Return active grants as (user_id, granted_by, created_at, expires_at)."""
+        now = datetime.now(timezone.utc)
+        with self._connect() as connection:
+            # Drop expired rows first so list stays clean.
+            connection.execute(
+                """
+                DELETE FROM allowed_users
+                WHERE expires_at IS NOT NULL AND expires_at <= ?
+                """,
+                (_dt(now),),
+            )
+            rows = connection.execute(
+                """
+                SELECT user_id, granted_by, created_at, expires_at
+                FROM allowed_users
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        result: list[tuple[int, int | None, datetime, datetime | None]] = []
+        for row in rows:
+            created = _parse_dt(row["created_at"]) or now
+            expires = _parse_dt(row["expires_at"])
+            result.append((int(row["user_id"]), row["granted_by"], created, expires))
+        return result
 
     def get_user_filters(self, user_id: int) -> SearchFilters:
         with self._connect() as connection:
@@ -326,6 +439,70 @@ class ChannelStorage:
         with self._connect() as connection:
             rows = connection.execute(query, params).fetchall()
         return [_row_scan(row) for row in rows]
+
+    def get_scan(self, scan_id: str, *, user_id: int | None = None) -> ScanRecord | None:
+        query = "SELECT * FROM scans WHERE scan_id = ?"
+        params: list[object] = [scan_id]
+        if user_id is not None:
+            query += " AND user_id = ?"
+            params.append(user_id)
+        with self._connect() as connection:
+            row = connection.execute(query, params).fetchone()
+        return _row_scan(row) if row else None
+
+    def scan_ordinal(self, scan_id: str) -> int:
+        """1-based sequential number of the scan among the same user's scans."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM scans AS s1
+                JOIN scans AS s2 ON s2.scan_id = ?
+                WHERE s1.user_id IS s2.user_id
+                  AND (
+                    s1.started_at < s2.started_at
+                    OR (s1.started_at = s2.started_at AND s1.scan_id <= s2.scan_id)
+                  )
+                """,
+                (scan_id,),
+            ).fetchone()
+        return int(row["n"]) if row else 1
+
+    def count_reports(self, scan_id: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS n FROM channel_reports WHERE scan_id = ?",
+                (scan_id,),
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def reports_page(self, scan_id: str, *, offset: int = 0, limit: int = 8) -> list[ChannelReport]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM channel_reports
+                WHERE scan_id = ?
+                ORDER BY activity_score DESC, avg_views_recent DESC
+                LIMIT ? OFFSET ?
+                """,
+                (scan_id, limit, offset),
+            ).fetchall()
+        return [_row_report(row) for row in rows]
+
+    def delete_scan(self, scan_id: str, *, user_id: int) -> bool:
+        with self._connect() as connection:
+            owned = connection.execute(
+                "SELECT 1 FROM scans WHERE scan_id = ? AND user_id = ?",
+                (scan_id, user_id),
+            ).fetchone()
+            if not owned:
+                return False
+            connection.execute("DELETE FROM channel_reports WHERE scan_id = ?", (scan_id,))
+            cursor = connection.execute(
+                "DELETE FROM scans WHERE scan_id = ? AND user_id = ?",
+                (scan_id, user_id),
+            )
+        return cursor.rowcount > 0
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._path, timeout=30)

@@ -31,6 +31,7 @@ class AppSettings:
     discovery_gift_limit: int
     bot_proxy_url: str | None
     telegram_proxy_url: str | None
+    admin_user_ids: frozenset[int]
 
     @classmethod
     def from_env(cls, *, require_bot_token: bool = True) -> "AppSettings":
@@ -70,7 +71,11 @@ class AppSettings:
             discovery_gift_limit=_non_negative_int("DISCOVERY_GIFT_LIMIT", 10),
             bot_proxy_url=bot_proxy_url,
             telegram_proxy_url=telegram_proxy_url,
+            admin_user_ids=_parse_id_set("ADMIN_USER_IDS"),
         )
+
+    def is_admin(self, user_id: int) -> bool:
+        return user_id in self.admin_user_ids
 
 
 def database_path_from_env() -> Path:
@@ -116,3 +121,22 @@ def _non_negative_int(name: str, default: int) -> int:
     if parsed < 0:
         raise ConfigError(f"{name} must be >= 0")
     return parsed
+
+
+def _parse_id_set(name: str) -> frozenset[int]:
+    raw = _optional(name, "") or ""
+    if not raw.strip():
+        return frozenset()
+    ids: set[int] = set()
+    for part in raw.replace(";", ",").split(","):
+        token = part.strip()
+        if not token:
+            continue
+        try:
+            value = int(token)
+        except ValueError as exc:
+            raise ConfigError(f"{name} must be a comma-separated list of integers") from exc
+        if value <= 0:
+            raise ConfigError(f"{name} entries must be positive Telegram user ids")
+        ids.add(value)
+    return frozenset(ids)

@@ -91,6 +91,65 @@ def format_scan_done(scan_id: str, total_candidates: int, total_reports: int, er
     return text
 
 
+RESULTS_PAGE_SIZE = 8
+
+
+def format_compact_results_page(
+    *,
+    ordinal: int,
+    source_label: str,
+    total_reports: int,
+    page: int,
+    page_size: int = RESULTS_PAGE_SIZE,
+    reports: list[ChannelReport],
+) -> str:
+    """Compact discovery/search results layout (paginated list)."""
+    total_pages = max(1, (total_reports + page_size - 1) // page_size) if total_reports else 1
+    page = max(1, min(page, total_pages))
+    lines = [
+        f"📋 ЗАПИСЬ #{ordinal}",
+        f"📣 Источник: {source_label}",
+        f"👥 Найдено всего: {total_reports} каналов",
+        f"📄 Страница: {page} из {total_pages}",
+        "",
+    ]
+    if not reports:
+        lines.append("На этой странице пусто.")
+        return "\n".join(lines)
+
+    for report in reports:
+        lines.append(format_compact_channel_entry(report))
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def format_compact_channel_entry(report: ChannelReport) -> str:
+    owner = report.owner_label
+    if owner:
+        owner_line = f"👤 {owner}"
+    else:
+        owner_line = f"👤 {report.title}"
+    channel = report.display_link
+    if report.username:
+        channel = f"@{report.username}"
+    subs = _num(report.subscribers) if report.subscribers is not None else "?"
+    return f"{owner_line}\n📣 Канал: {channel} ({subs} подп.)"
+
+
+def source_label_from_scan(scan: ScanRecord) -> str:
+    if not scan.queries:
+        return "—"
+    first = scan.queries[0]
+    if first.startswith("posts:") or ":" in first and first.split(":", 1)[0] in {
+        "comments",
+        "profile",
+        "gifts",
+        "subs",
+    }:
+        return first
+    return first
+
+
 def format_discovery_stats(result: SearchRunResult) -> str:
     stats = result.stats
     if not stats:

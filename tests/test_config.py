@@ -44,6 +44,25 @@ def test_settings_allow_disabling_gift_discovery(monkeypatch: pytest.MonkeyPatch
     assert settings.discovery_gift_limit == 0
 
 
+def test_settings_parse_admin_user_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("ADMIN_USER_IDS", "111, 222;333")
+
+    settings = AppSettings.from_env(require_bot_token=True)
+
+    assert settings.admin_user_ids == frozenset({111, 222, 333})
+    assert settings.is_admin(111)
+    assert not settings.is_admin(999)
+
+
+def test_settings_reject_invalid_admin_user_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("ADMIN_USER_IDS", "abc")
+
+    with pytest.raises(ConfigError, match="ADMIN_USER_IDS"):
+        AppSettings.from_env(require_bot_token=True)
+
+
 def _set_required_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BOT_TOKEN", "123456:test")
     monkeypatch.setenv("TELEGRAM_API_ID", "123456")
@@ -52,3 +71,4 @@ def _set_required_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("BOT_PROXY_URL", raising=False)
     monkeypatch.delenv("TELEGRAM_PROXY_URL", raising=False)
     monkeypatch.delenv("DISCOVERY_GIFT_LIMIT", raising=False)
+    monkeypatch.delenv("ADMIN_USER_IDS", raising=False)

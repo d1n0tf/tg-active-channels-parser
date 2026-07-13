@@ -15,6 +15,7 @@ from telethon.errors import (
     FloodWaitError,
     MsgIdInvalidError,
     RPCError,
+    TimedOutError,
     UsernameInvalidError,
     UsernameNotOccupiedError,
 )
@@ -204,6 +205,10 @@ class TelegramChannelCollector:
             "skipped_channels": 0,
             "reports_found": 0,
             "collection_finished_early": 0,
+            "phase": 1,  # 1 = posts/comments, 2 = candidate inspection
+            "candidates_total": 0,
+            "candidates_done": 0,
+            "network_retries": 0,
         }
         skipped_channels = 0
         inspected_channels = 0
@@ -296,13 +301,21 @@ class TelegramChannelCollector:
                 break
 
         # Hard cancel skips candidate inspection. Soft finish still processes collected candidates.
-        for identifier, source in list(candidates.items())[:candidate_limit]:
+        to_inspect = [
+            (identifier, source)
+            for identifier, source in list(candidates.items())[:candidate_limit]
+            if identifier.lower() != source_username.lower()
+        ]
+        stats["phase"] = 2
+        stats["candidates_total"] = len(to_inspect)
+        stats["candidates_done"] = 0
+        await _notify_progress(progress_callback, stats)
+
+        for identifier, source in to_inspect:
             if _should_stop(should_stop):
                 if "Остановлено пользователем" not in errors:
                     errors.append("Остановлено пользователем")
                 break
-            if identifier.lower() == source_username.lower():
-                continue
             try:
                 report = await self.inspect_channel_identifier(identifier, matched_query=f"discover:{source.label}")
                 inspected_channels += 1
@@ -312,6 +325,7 @@ class TelegramChannelCollector:
                 stats["skipped_channels"] = skipped_channels
                 if len(errors) < 20:
                     errors.append(f"{identifier}: {type(exc).__name__}")
+                stats["candidates_done"] = min(stats["candidates_total"], stats["candidates_done"] + 1)
                 await _notify_progress(progress_callback, stats)
                 continue
             except Exception as exc:
@@ -319,6 +333,7 @@ class TelegramChannelCollector:
                 stats["skipped_channels"] = skipped_channels
                 if len(errors) < 20:
                     errors.append(f"{identifier}: {type(exc).__name__}: {exc}")
+                stats["candidates_done"] = min(stats["candidates_total"], stats["candidates_done"] + 1)
                 await _notify_progress(progress_callback, stats)
                 continue
 
@@ -329,11 +344,11 @@ class TelegramChannelCollector:
                         existing.matched_queries.append(query)
                 _apply_report_owner(existing, source)
                 stats["reports_found"] = len(reports_by_id)
-                await _notify_progress(progress_callback, stats)
-                continue
-            _apply_report_owner(report, source)
-            reports_by_id[report.telegram_id] = report
-            stats["reports_found"] = len(reports_by_id)
+            else:
+                _apply_report_owner(report, source)
+                reports_by_id[report.telegram_id] = report
+                stats["reports_found"] = len(reports_by_id)
+            stats["candidates_done"] = min(stats["candidates_total"], stats["candidates_done"] + 1)
             await _notify_progress(progress_callback, stats)
 
         filtered = [
@@ -522,13 +537,45 @@ class TelegramChannelCollector:
         return _collect_gift_channel_refs(candidates, saved_gifts)
 
     async def _with_short_flood_retry(self, func, *args, **kwargs):
+        return await self._with_resilient_call(func, *args, **kwargs)
+
+    async def _ensure_connected(self) -> None:
         try:
-            return await func(*args, **kwargs)
-        except FloodWaitError as exc:
-            if exc.seconds > self._settings.flood_sleep_limit_seconds:
+            if not self._client.is_connected():
+                await self._client.connect()
+        except Exception:
+            try:
+                await self._disconnect()
+            except Exception:
+                pass
+            await self._client.connect()
+
+    async def _with_resilient_call(self, func, *args, attempts: int = 4, **kwargs):
+        """Retry FloodWait (short) and transient network failures with reconnect."""
+        last_exc: BaseException | None = None
+        for attempt in range(attempts):
+            try:
+                return await func(*args, **kwargs)
+            except FloodWaitError as exc:
+                last_exc = exc
+                if exc.seconds > self._settings.flood_sleep_limit_seconds:
+                    raise
+                await asyncio.sleep(exc.seconds)
+            except (TimedOutError, ConnectionError, OSError, asyncio.TimeoutError) as exc:
+                last_exc = exc
+                await self._ensure_connected()
+                await asyncio.sleep(min(2**attempt, 12))
+            except RPCError as exc:
+                # Some RPC/network blips are worth a short retry + reconnect.
+                name = type(exc).__name__
+                if name in {"TimedOutError", "ServerError", "TimeoutError", "NetworkMigrateError"} or "timeout" in str(exc).lower():
+                    last_exc = exc
+                    await self._ensure_connected()
+                    await asyncio.sleep(min(2**attempt, 12))
+                    continue
                 raise
-            await asyncio.sleep(exc.seconds)
-            return await func(*args, **kwargs)
+        assert last_exc is not None
+        raise last_exc
 
     async def inspect_channel_identifier(
         self, identifier: str, *, matched_query: str = "manual"

@@ -5,7 +5,15 @@ import io
 from datetime import datetime, timedelta, timezone
 
 from ChannelsParser.audience import estimate_audience
-from ChannelsParser.formatting import format_discovery_stats, format_filter_presets, format_report, format_scan_history, reports_to_csv
+from ChannelsParser.formatting import (
+    format_compact_channel_entry,
+    format_compact_results_page,
+    format_discovery_stats,
+    format_filter_presets,
+    format_report,
+    format_scan_history,
+    reports_to_csv,
+)
 from ChannelsParser.models import ChannelReport, FilterPreset, ScanRecord, SearchFilters, SearchRunResult
 
 
@@ -65,6 +73,39 @@ def test_format_filter_presets_shows_compact_filter_summary() -> None:
     assert "Малые женские" in text
     assert "Подписчики: 100-300" in text
     assert "Просмотры: 50" in text
+
+
+def test_format_compact_results_page_matches_reference_layout() -> None:
+    report = _zero_report()
+    report.owner_username = "kraitts"
+    report.owner_display_name = "Dari_krr_"
+    report.username = "kraitts"
+    report.subscribers = 146
+
+    text = format_compact_results_page(
+        ordinal=148,
+        source_label="@lunarnii",
+        total_reports=24,
+        page=1,
+        page_size=8,
+        reports=[report],
+    )
+
+    assert "ЗАПИСЬ #148" in text
+    assert "Источник: @lunarnii" in text
+    assert "Найдено всего: 24 каналов" in text
+    assert "Страница: 1 из 3" in text
+    assert "Dari_krr_ (@kraitts)" in text or "@kraitts" in text
+    assert "@kraitts" in text
+    assert "146" in text
+    assert "Score:" not in text
+
+
+def test_format_compact_channel_entry_without_owner() -> None:
+    report = _zero_report()
+    text = format_compact_channel_entry(report)
+    assert "Канал:" in text
+    assert "подп." in text
 
 
 def test_format_discovery_stats_shows_funnel() -> None:

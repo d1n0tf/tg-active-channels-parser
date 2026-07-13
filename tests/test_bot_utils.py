@@ -4,16 +4,21 @@ import asyncio
 from types import SimpleNamespace
 
 from ChannelsParser.bot import (
+    AccessControl,
     BotState,
     filter_section_keyboard,
     filters_keyboard,
+    format_access_denied,
+    format_allowlist,
     format_filter_dashboard,
     main_keyboard,
+    parse_allow_args,
     parse_discover_args,
     run_discovery,
     run_scan,
     scan_cancel_keyboard,
     split_text,
+    _parse_user_ids,
 )
 from ChannelsParser.models import DiscoveryOptions, SearchFilters, SearchRunResult, discovery_filters
 
@@ -84,6 +89,33 @@ def test_scan_cancel_keyboard_uses_reference_actions() -> None:
     buttons = [button.text for row in scan_cancel_keyboard().inline_keyboard for button in row]
 
     assert buttons == ["💾 Завершить досрочно", "🚫 Отмена"]
+
+
+def test_parse_user_ids_and_access_control() -> None:
+    assert _parse_user_ids("111 222,333") == [111, 222, 333]
+    assert parse_allow_args("123456789") == ([123456789], None)
+    assert parse_allow_args("123456789 30") == ([123456789], 30)
+    assert parse_allow_args("111 222") == ([111, 222], None)
+    assert parse_allow_args("5000 30d") == ([5000], 30)
+    assert parse_allow_args("111 222 7d") == ([111, 222], 7)
+    assert parse_allow_args("111 222 7д") == ([111, 222], 7)
+    storage = FakeStorage()
+
+    class S:
+        admin_user_ids = frozenset({1})
+
+        def is_admin(self, user_id: int) -> bool:
+            return user_id == 1
+
+    access = AccessControl(S(), storage)  # type: ignore
+    assert access.has_access(1) is True
+    assert access.has_access(100) is False
+    storage.grant_access(100, granted_by=1, days=7)
+    assert access.has_access(100) is True
+    assert "закрыт" in format_access_denied(100).lower() or "закрыт" in format_access_denied(100)
+    text = format_allowlist(S(), storage)  # type: ignore
+    assert "100" in text
+    assert "1" in text
 
 
 def test_bot_state_soft_finish_does_not_hard_cancel() -> None:
@@ -238,6 +270,8 @@ class FakeStorage:
         self.filters = filters or SearchFilters()
         self.created_scans: list[str] = []
         self.created_scan_filters: list[SearchFilters] = []
+        self._scan_meta: dict[str, dict] = {}
+        self._reports: dict[str, list] = {}
 
     def get_user_filters(self, user_id: int) -> SearchFilters:
         return self.filters
@@ -245,12 +279,105 @@ class FakeStorage:
     def create_scan(self, scan_id: str, **kwargs) -> None:
         self.created_scans.append(scan_id)
         self.created_scan_filters.append(kwargs["filters"])
+        self._scan_meta[scan_id] = {
+            "user_id": kwargs.get("user_id"),
+            "mode": kwargs.get("mode", "search"),
+            "queries": kwargs.get("queries", []),
+            "filters": kwargs["filters"],
+        }
+        self._reports[scan_id] = []
 
     def save_reports(self, scan_id: str, reports) -> None:
-        pass
+        self._reports[scan_id] = list(reports)
 
     def finish_scan(self, scan_id: str, **kwargs) -> None:
         pass
 
     def fail_scan(self, scan_id: str, **kwargs) -> None:
         pass
+
+    def get_scan(self, scan_id: str, *, user_id: int | None = None):
+        meta = self._scan_meta.get(scan_id)
+        if meta is None:
+            return None
+        if user_id is not None and meta.get("user_id") != user_id:
+            return None
+        from datetime import datetime, timezone
+
+        from ChannelsParser.models import ScanRecord
+
+        return ScanRecord(
+            scan_id=scan_id,
+            user_id=meta.get("user_id"),
+            mode=meta.get("mode", "search"),
+            status="done",
+            queries=meta.get("queries", []),
+            filters=meta.get("filters", SearchFilters()),
+            total_candidates=0,
+            total_reports=len(self._reports.get(scan_id, [])),
+            error=None,
+            started_at=datetime.now(timezone.utc),
+        )
+
+    def count_reports(self, scan_id: str) -> int:
+        return len(self._reports.get(scan_id, []))
+
+    def reports_page(self, scan_id: str, *, offset: int = 0, limit: int = 8):
+        rows = self._reports.get(scan_id, [])
+        return rows[offset : offset + limit]
+
+    def scan_ordinal(self, scan_id: str) -> int:
+        try:
+            return self.created_scans.index(scan_id) + 1
+        except ValueError:
+            return 1
+
+    def delete_scan(self, scan_id: str, *, user_id: int) -> bool:
+        meta = self._scan_meta.get(scan_id)
+        if meta is None or meta.get("user_id") != user_id:
+            return False
+        self._scan_meta.pop(scan_id, None)
+        self._reports.pop(scan_id, None)
+        return True
+
+    def is_user_allowed(self, user_id: int) -> bool:
+        return user_id in getattr(self, "_allowed", set())
+
+    def grant_access(
+        self,
+        user_id: int,
+        *,
+        granted_by: int | None = None,
+        note: str | None = None,
+        days: int | None = None,
+    ) -> str:
+        from datetime import datetime, timedelta, timezone
+
+        allowed = getattr(self, "_allowed", set())
+        now = datetime.now(timezone.utc)
+        expires = None if days is None else now + timedelta(days=days)
+        grants = getattr(self, "_grants", [])
+        existing = next((i for i, g in enumerate(grants) if g[0] == user_id), None)
+        row = (user_id, granted_by, now, expires)
+        if existing is not None:
+            grants[existing] = row
+            self._grants = grants
+            return "updated"
+        allowed.add(user_id)
+        self._allowed = allowed
+        grants.append(row)
+        self._grants = grants
+        return "created"
+
+    def revoke_access(self, user_id: int) -> bool:
+        allowed = getattr(self, "_allowed", set())
+        if user_id not in allowed:
+            return False
+        allowed.discard(user_id)
+        self._allowed = allowed
+        grants = getattr(self, "_grants", [])
+        self._grants = [g for g in grants if g[0] != user_id]
+        return True
+
+    def list_allowed_users(self, *, limit: int = 200):
+        return list(getattr(self, "_grants", []))[:limit]
