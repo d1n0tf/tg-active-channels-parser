@@ -19,12 +19,14 @@ class AppSettings:
     telegram_api_id: int
     telegram_api_hash: str
     telegram_session: str
+    telegram_sessions_dir: Path
     telegram_phone: str | None
     database_path: Path
     search_limit_per_query: int
     history_limit: int
     top_results: int
     flood_sleep_limit_seconds: int
+    flood_switch_threshold_seconds: int
     discovery_comments_per_post: int
     discovery_profile_limit: int
     discovery_candidate_limit: int
@@ -59,12 +61,20 @@ class AppSettings:
             telegram_api_id=api_id,
             telegram_api_hash=_required("TELEGRAM_API_HASH"),
             telegram_session=_optional("TELEGRAM_SESSION", "data/telegram.session") or "data/telegram.session",
+            telegram_sessions_dir=Path(
+                _optional("TELEGRAM_SESSIONS_DIR", "data/sessions") or "data/sessions"
+            ),
             telegram_phone=_optional("TELEGRAM_PHONE"),
             database_path=Path(_optional("DATABASE_PATH", "data/channels.sqlite3") or "data/channels.sqlite3"),
             search_limit_per_query=_positive_int("SEARCH_LIMIT_PER_QUERY", 40),
             history_limit=_positive_int("HISTORY_LIMIT", 40),
             top_results=_positive_int("TOP_RESULTS", 10),
             flood_sleep_limit_seconds=_positive_int("FLOOD_SLEEP_LIMIT_SECONDS", 60),
+            # Switch account when FloodWait is longer than this (defaults to FLOOD_SLEEP_LIMIT_SECONDS).
+            flood_switch_threshold_seconds=_positive_int(
+                "FLOOD_SWITCH_THRESHOLD_SECONDS",
+                _positive_int("FLOOD_SLEEP_LIMIT_SECONDS", 60),
+            ),
             discovery_comments_per_post=_positive_int("DISCOVERY_COMMENTS_PER_POST", 100),
             discovery_profile_limit=_positive_int("DISCOVERY_PROFILE_LIMIT", 500),
             discovery_candidate_limit=_positive_int("DISCOVERY_CANDIDATE_LIMIT", 300),

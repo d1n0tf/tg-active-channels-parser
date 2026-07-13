@@ -175,6 +175,7 @@ async def run_bot() -> None:
     await collector.connect()
 
     bot: Bot | None = None
+    renewal_task: asyncio.Task[None] | None = None
     try:
         bot = Bot(
             settings.bot_token or "",
@@ -183,11 +184,60 @@ async def run_bot() -> None:
         dispatcher = Dispatcher()
         dispatcher.include_router(build_router(collector, storage, settings))
         await bot.delete_webhook(drop_pending_updates=True)
+        renewal_task = asyncio.create_task(
+            renewal_reminder_loop(bot, storage),
+            name="renewal-reminder-loop",
+        )
         await dispatcher.start_polling(bot)
     finally:
+        if renewal_task is not None:
+            renewal_task.cancel()
+            try:
+                await renewal_task
+            except asyncio.CancelledError:
+                pass
         await collector.close()
         if bot is not None:
             await bot.session.close()
+
+
+RENEWAL_REMINDER_HOURS = 12.0
+RENEWAL_CHECK_INTERVAL_SECONDS = 5 * 60
+ACCESS_ADMIN_HANDLE = "@maxxkireev"
+
+
+async def renewal_reminder_loop(bot: Bot, storage: ChannelStorage) -> None:
+    """Periodically notify users whose access ends within 12 hours."""
+    while True:
+        try:
+            pending = storage.list_users_needing_renewal_reminder(within_hours=RENEWAL_REMINDER_HOURS)
+            for user_id, expires_at in pending:
+                try:
+                    await bot_send_branded(bot, user_id, format_renewal_reminder(expires_at))
+                    storage.mark_renewal_notified(user_id)
+                    logging.info("Sent renewal reminder to user_id=%s expires=%s", user_id, expires_at)
+                except Exception:
+                    logging.warning(
+                        "Failed to send renewal reminder to user_id=%s",
+                        user_id,
+                        exc_info=True,
+                    )
+        except Exception:
+            logging.exception("Renewal reminder loop error")
+        await asyncio.sleep(RENEWAL_CHECK_INTERVAL_SECONDS)
+
+
+async def bot_send_branded(bot: Bot, chat_id: int, text: str) -> None:
+    logo = logo_input_file()
+    if logo is not None:
+        try:
+            if len(text) <= TELEGRAM_CAPTION_LIMIT:
+                await bot.send_photo(chat_id, logo, caption=text)
+                return
+            await bot.send_photo(chat_id, logo)
+        except Exception:
+            logging.debug("Could not send branded photo to %s", chat_id, exc_info=True)
+    await bot.send_message(chat_id, text)
 
 
 def build_router(
@@ -280,7 +330,21 @@ def build_router(
         storage.save_user_filters(
             message.from_user.id, state.filters(message.from_user.id)
         )
-        await send_branded(message, format_main_menu(), reply_markup=main_keyboard())
+        await send_branded(
+            message,
+            format_main_menu(settings, storage, message.from_user.id),
+            reply_markup=main_keyboard(),
+        )
+
+    @router.message(Command("access", "subscription", "подписка"))
+    async def access_status_message(message: Message) -> None:
+        if not message.from_user:
+            return
+        await send_branded(
+            message,
+            format_access_status(settings, storage, message.from_user.id),
+            reply_markup=main_keyboard(),
+        )
 
     @router.message(Command("help"))
     async def help_message(message: Message) -> None:
@@ -648,9 +712,13 @@ def build_router(
     @router.callback_query(F.data == "menu:main")
     async def main_menu_callback(callback: CallbackQuery) -> None:
         message = _callback_message(callback)
-        if message is None:
+        if message is None or not callback.from_user:
             return
-        await _edit_or_answer(message, format_main_menu(), reply_markup=main_keyboard())
+        await _edit_or_answer(
+            message,
+            format_main_menu(settings, storage, callback.from_user.id),
+            reply_markup=main_keyboard(),
+        )
         await callback.answer()
 
     @router.callback_query(F.data == "parsing")
@@ -916,7 +984,7 @@ def build_router(
             return
         await _edit_or_answer(
             message,
-            format_accounts_menu(settings.telegram_session),
+            format_accounts_menu(collector.pool),
             reply_markup=accounts_keyboard(),
         )
         await callback.answer()
@@ -1843,7 +1911,7 @@ async def edit_branded(
             logging.debug("Could not edit photo caption", exc_info=True)
     if hasattr(message, "edit_text"):
         try:
-            return await edit_branded(message, text, reply_markup=reply_markup)
+            return await message.edit_text(text, reply_markup=reply_markup)
         except Exception:
             logging.debug("Could not edit text message, sending new branded", exc_info=True)
     return await send_branded(message, text, reply_markup=reply_markup)
@@ -1945,15 +2013,107 @@ def _split_long_block(block: str, *, chunk_size: int) -> list[str]:
     return chunks
 
 
-def format_main_menu() -> str:
-    return (
-        "🚀 BatMan Parser\n\n"
-        "Поиск и аудит активных Telegram-каналов под закуп рекламы.\n\n"
-        "• 🧻 Парсинг — пресеты, свой поиск, discovery, check\n"
-        "• 💾 База — результаты, история, CSV\n"
-        "• ⚙️ Фильтры — подписчики, ЦА, score и сортировка\n\n"
-        "Подсказка: /find ключи, /discover @channel 200, /check @channel"
+def format_main_menu(
+    settings: AppSettings | None = None,
+    storage: ChannelStorage | None = None,
+    user_id: int | None = None,
+) -> str:
+    lines = [
+        "🚀 BatMan Parser",
+        "",
+        "Поиск и аудит активных Telegram-каналов под закуп рекламы.",
+        "",
+        "• 🧻 Парсинг — пресеты, свой поиск, discovery, check",
+        "• 💾 База — результаты, история, CSV",
+        "• ⚙️ Фильтры — подписчики, ЦА, score и сортировка",
+    ]
+    if settings is not None and storage is not None and user_id is not None:
+        lines.extend(["", format_access_status(settings, storage, user_id, compact=True)])
+    lines.extend(
+        [
+            "",
+            "Подсказка: /find ключи, /discover @channel 200, /check @channel",
+            "Статус доступа: /access",
+        ]
     )
+    return "\n".join(lines)
+
+
+def format_access_status(
+    settings: AppSettings,
+    storage: ChannelStorage,
+    user_id: int,
+    *,
+    compact: bool = False,
+) -> str:
+    if settings.is_admin(user_id):
+        if compact:
+            return "👑 Доступ: админ (без срока)"
+        return (
+            "👑 Статус доступа\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Ты администратор — доступ без срока.\n"
+            f"Выдача доступа другим: /allow id [дни]"
+        )
+
+    expiry = storage.get_access_expiry(user_id)
+    if expiry is False:
+        if compact:
+            return "🔒 Доступ: нет"
+        return format_access_denied(user_id)
+
+    if expiry is None:
+        if compact:
+            return "🔓 Доступ: бессрочный"
+        return (
+            "🔓 Статус доступа\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Доступ бессрочный.\n"
+            f"По вопросам: {ACCESS_ADMIN_HANDLE}"
+        )
+
+    remaining = expiry - datetime.now(timezone.utc)
+    left = format_remaining_duration(remaining)
+    until = expiry.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+    if compact:
+        return f"⏳ Доступ до {until}\n   Осталось: {left}\n   Продление: {ACCESS_ADMIN_HANDLE}"
+    return (
+        "⏳ Статус доступа\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Действует до: {until}\n"
+        f"Осталось: {left}\n\n"
+        f"Продлить подписку → {ACCESS_ADMIN_HANDLE}"
+    )
+
+
+def format_renewal_reminder(expires_at: datetime) -> str:
+    until = expires_at.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+    left = format_remaining_duration(expires_at - datetime.now(timezone.utc))
+    return (
+        "⏰ Напоминание о подписке\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Доступ к BatMan Parser скоро закончится.\n\n"
+        f"До: {until}\n"
+        f"Осталось примерно: {left}\n\n"
+        f"Чтобы продлить — напиши администратору:\n"
+        f"{ACCESS_ADMIN_HANDLE}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+def format_remaining_duration(delta: timedelta) -> str:
+    total_seconds = max(0, int(delta.total_seconds()))
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days} дн.")
+    if hours or days:
+        parts.append(f"{hours} ч.")
+    if minutes or not parts:
+        parts.append(f"{minutes} мин.")
+    return " ".join(parts)
 
 
 def format_parsing_menu() -> str:
@@ -1978,13 +2138,44 @@ def format_database_menu(*, has_history: bool, has_results: bool) -> str:
     )
 
 
-def format_accounts_menu(session_path: object) -> str:
-    return (
-        "🧾 Мои аккаунты\n\n"
-        "Парсер ходит в Telegram через пользовательскую сессию Telethon.\n"
-        f"Сессия: `{session_path}`\n\n"
-        "Чтобы сменить аккаунт — перелогинься через login CLI."
+def format_accounts_menu(pool: object) -> str:
+    from ChannelsParser.accounts import AccountPool
+
+    lines = [
+        "🧾 Парсер-аккаунты",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "User-сессии Telethon (не bot token).",
+        "При длинном FloodWait бот сам переключается на другой.",
+        "",
+    ]
+    if not isinstance(pool, AccountPool):
+        lines.append("Пул недоступен.")
+        return "\n".join(lines)
+
+    infos = pool.list_info()
+    if not infos:
+        lines.append("Аккаунтов нет.")
+    for info in infos:
+        mark = "▶" if info.is_active else "·"
+        cool = ""
+        if info.is_cooling and info.cooldown_until:
+            cool = f"\n    cooldown до {info.cooldown_until.strftime('%d.%m %H:%M')} UTC"
+        err = f"\n    ⚠ {info.last_error}" if info.last_error and not info.is_cooling else ""
+        lines.append(
+            f"{mark} {info.account_id} · {info.label}\n"
+            f"    статус: {info.status_label} · floods: {info.total_flood_waits}"
+            f"{cool}{err}"
+        )
+    lines.extend(
+        [
+            "",
+            "Добавить аккаунт (на сервере):",
+            "uv run tg-active-channels-login --name acc2 --phone +79...",
+            "uv run tg-active-channels-login --list",
+        ]
     )
+    return "\n".join(lines)
 
 
 def format_subscription_menu() -> str:
@@ -2014,6 +2205,9 @@ def format_help() -> str:
         "/filterpresets — мои пресеты\n\n"
         "💾 База\n"
         "/latest · /history · /export\n\n"
+        "⏳ Доступ\n"
+        "/access — сколько осталось\n"
+        f"Продление: {ACCESS_ADMIN_HANDLE}\n\n"
         f"{SET_HELP}"
     )
 

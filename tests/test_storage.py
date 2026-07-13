@@ -82,6 +82,39 @@ def test_storage_allowed_users_supports_ttl_days(tmp_path) -> None:
     assert storage.is_user_allowed(200) is False
 
 
+def test_storage_renewal_reminder_window(tmp_path) -> None:
+    from datetime import timedelta, timezone
+    import sqlite3
+
+    storage = ChannelStorage(tmp_path / "channels.sqlite3")
+    storage.init()
+    storage.grant_access(300, granted_by=1, days=1)
+
+    soon = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+    with sqlite3.connect(tmp_path / "channels.sqlite3") as connection:
+        connection.execute(
+            "UPDATE allowed_users SET expires_at = ?, renewal_notified_at = NULL WHERE user_id = 300",
+            (soon,),
+        )
+
+    pending = storage.list_users_needing_renewal_reminder(within_hours=12)
+    assert len(pending) == 1
+    assert pending[0][0] == 300
+
+    storage.mark_renewal_notified(300)
+    assert storage.list_users_needing_renewal_reminder(within_hours=12) == []
+
+    # Renew clears notification flag
+    storage.grant_access(300, granted_by=1, days=1)
+    soon2 = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
+    with sqlite3.connect(tmp_path / "channels.sqlite3") as connection:
+        connection.execute(
+            "UPDATE allowed_users SET expires_at = ?, renewal_notified_at = NULL WHERE user_id = 300",
+            (soon2,),
+        )
+    assert len(storage.list_users_needing_renewal_reminder(within_hours=12)) == 1
+
+
 def test_storage_delete_scan_removes_reports(tmp_path) -> None:
     storage = ChannelStorage(tmp_path / "channels.sqlite3")
     storage.init()

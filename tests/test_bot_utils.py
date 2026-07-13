@@ -9,8 +9,12 @@ from ChannelsParser.bot import (
     filter_section_keyboard,
     filters_keyboard,
     format_access_denied,
+    format_access_status,
     format_allowlist,
     format_filter_dashboard,
+    format_main_menu,
+    format_remaining_duration,
+    format_renewal_reminder,
     main_keyboard,
     parse_allow_args,
     parse_discover_args,
@@ -116,6 +120,15 @@ def test_parse_user_ids_and_access_control() -> None:
     text = format_allowlist(S(), storage)  # type: ignore
     assert "100" in text
     assert "1" in text
+    status = format_access_status(S(), storage, 100)  # type: ignore
+    assert "Доступ" in status or "доступ" in status.lower()
+    assert "maxxkireev" in format_renewal_reminder(
+        __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+        + __import__("datetime").timedelta(hours=10)
+    )
+    assert "ч." in format_remaining_duration(__import__("datetime").timedelta(hours=5, minutes=12))
+    menu = format_main_menu(S(), storage, 100)  # type: ignore
+    assert "Доступ" in menu or "доступ" in menu.lower()
 
 
 def test_bot_state_soft_finish_does_not_hard_cancel() -> None:
@@ -341,7 +354,38 @@ class FakeStorage:
         return True
 
     def is_user_allowed(self, user_id: int) -> bool:
-        return user_id in getattr(self, "_allowed", set())
+        return self.get_access_expiry(user_id) is not False
+
+    def get_access_expiry(self, user_id: int):
+        from datetime import datetime, timezone
+
+        if user_id not in getattr(self, "_allowed", set()):
+            return False
+        grants = getattr(self, "_grants", [])
+        for g in grants:
+            if g[0] == user_id:
+                return g[3]  # expires_at or None
+        return None
+
+    def list_users_needing_renewal_reminder(self, *, within_hours: float = 12.0):
+        from datetime import datetime, timezone, timedelta
+
+        now = datetime.now(timezone.utc)
+        horizon = now + timedelta(hours=within_hours)
+        notified = getattr(self, "_renewal_notified", set())
+        out = []
+        for g in getattr(self, "_grants", []):
+            user_id, _by, _created, expires = g
+            if expires is None or user_id in notified:
+                continue
+            if now < expires <= horizon:
+                out.append((user_id, expires))
+        return out
+
+    def mark_renewal_notified(self, user_id: int) -> None:
+        notified = getattr(self, "_renewal_notified", set())
+        notified.add(user_id)
+        self._renewal_notified = notified
 
     def grant_access(
         self,
@@ -362,11 +406,17 @@ class FakeStorage:
         if existing is not None:
             grants[existing] = row
             self._grants = grants
+            notified = getattr(self, "_renewal_notified", set())
+            notified.discard(user_id)
+            self._renewal_notified = notified
             return "updated"
         allowed.add(user_id)
         self._allowed = allowed
         grants.append(row)
         self._grants = grants
+        notified = getattr(self, "_renewal_notified", set())
+        notified.discard(user_id)
+        self._renewal_notified = notified
         return "created"
 
     def revoke_access(self, user_id: int) -> bool:

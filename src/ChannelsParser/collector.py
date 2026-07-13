@@ -20,10 +20,10 @@ from telethon.errors import (
     UsernameNotOccupiedError,
 )
 
+from ChannelsParser.accounts import AccountPool
 from ChannelsParser.audience import estimate_audience
 from ChannelsParser.config import AppSettings
 from ChannelsParser.models import ChannelReport, SearchFilters, SearchRunResult
-from ChannelsParser.proxy import telethon_proxy
 from ChannelsParser.scoring import activity_score, matches_filters, sort_reports
 
 
@@ -53,30 +53,24 @@ class CandidateSource:
 
 
 class TelegramChannelCollector:
-    def __init__(self, settings: AppSettings):
+    def __init__(self, settings: AppSettings, pool: AccountPool | None = None):
         self._settings = settings
-        self._client = TelegramClient(
-            settings.telegram_session,
-            settings.telegram_api_id,
-            settings.telegram_api_hash,
-            proxy=telethon_proxy(settings.telegram_proxy_url),
-        )
+        self._pool = pool or AccountPool.from_settings(settings)
+
+    @property
+    def pool(self) -> AccountPool:
+        return self._pool
+
+    @property
+    def _client(self) -> TelegramClient:
+        """Always the currently active account client (after rotation)."""
+        return self._pool.client
 
     async def connect(self) -> None:
-        await self._client.connect()
-        if not await self._client.is_user_authorized():
-            await self._disconnect()
-            raise RuntimeError(
-                "Telegram user session is not authorized. Run: uv run python -m ChannelsParser.login"
-            )
+        await self._pool.connect()
 
     async def close(self) -> None:
-        await self._disconnect()
-
-    async def _disconnect(self) -> None:
-        result: object = self._client.disconnect()
-        if inspect.isawaitable(result):
-            await result
+        await self._pool.close()
 
     async def search_channels(
         self, queries: list[str], filters: SearchFilters, *, should_stop=None
@@ -93,11 +87,12 @@ class TelegramChannelCollector:
                 errors.append("Остановлено пользователем")
                 break
             try:
-                found = await self._with_short_flood_retry(
-                    self._search_public_chats, query
-                )
+                found = await self._with_short_flood_retry(lambda: self._search_public_chats(query))
             except FloodWaitError as exc:
-                errors.append(f"{query}: Telegram flood wait {exc.seconds}s")
+                wait_h = exc.seconds / 3600
+                errors.append(
+                    f"{query}: FloodWait {exc.seconds}s (~{wait_h:.1f}ч), аккаунты исчерпаны"
+                )
                 continue
             except RPCError as exc:
                 errors.append(f"{query}: {type(exc).__name__}")
@@ -117,15 +112,12 @@ class TelegramChannelCollector:
 
                 try:
                     report = await self._with_short_flood_retry(
-                        self.inspect_channel,
-                        chat,
-                        matched_query=query,
-                        now=now,
+                        lambda: self.inspect_channel(chat, matched_query=query, now=now)
                     )
                     inspected_channels += 1
                 except FloodWaitError as exc:
                     errors.append(
-                        f"{getattr(chat, 'username', chat.id)}: Telegram flood wait {exc.seconds}s"
+                        f"{getattr(chat, 'username', chat.id)}: FloodWait {exc.seconds}s, нет свободных аккаунтов"
                     )
                     skipped_channels += 1
                     continue
@@ -215,7 +207,16 @@ class TelegramChannelCollector:
 
         source_username = normalize_channel_identifier(source_identifier)
         try:
-            source = await self._with_short_flood_retry(self._client.get_entity, source_username)
+            source = await self._with_short_flood_retry(
+                lambda: self._client.get_entity(source_username)
+            )
+        except FloodWaitError as exc:
+            wait_h = max(1, exc.seconds // 3600)
+            raise RuntimeError(
+                f"Telegram FloodWait ~{exc.seconds}s (~{wait_h} ч). "
+                f"Все парсер-аккаунты в cooldown. Подожди или добавь ещё: "
+                f"uv run tg-active-channels-login --name acc2"
+            ) from exc
         except (UsernameInvalidError, UsernameNotOccupiedError, ChannelInvalidError) as exc:
             raise ValueError(f"Не смог найти донорский канал: {source_identifier}") from exc
         if not isinstance(source, types.Channel) or not _is_public_broadcast_channel(source):
@@ -384,9 +385,7 @@ class TelegramChannelCollector:
 
     async def _discussion_target(self, source: types.Channel, post: types.Message) -> tuple[types.TypeChat, int] | None:
         try:
-            discussion = await self._client(
-                functions.messages.GetDiscussionMessageRequest(peer=source, msg_id=post.id)
-            )
+            discussion = await self._discussion_request(source, post)
         except MsgIdInvalidError:
             return None
 
@@ -473,7 +472,11 @@ class TelegramChannelCollector:
             else:
                 try:
                     input_user = cast(types.TypeInputUser, utils.get_input_user(sender))
-                    full = await self._client(functions.users.GetFullUserRequest(id=input_user))
+                    full = await self._with_resilient_call(
+                        lambda: self._client(functions.users.GetFullUserRequest(id=input_user))
+                    )
+                except FloodWaitError:
+                    raise
                 except (TypeError, ValueError, RPCError):
                     full = None
 
@@ -523,13 +526,17 @@ class TelegramChannelCollector:
         stats["gift_profiles_checked"] += 1
         try:
             input_peer = cast(types.TypeInputPeer, utils.get_input_peer(sender))
-            saved_gifts = await self._client(
-                functions.payments.GetSavedStarGiftsRequest(
-                    peer=input_peer,
-                    offset="",
-                    limit=gift_limit,
+            saved_gifts = await self._with_resilient_call(
+                lambda: self._client(
+                    functions.payments.GetSavedStarGiftsRequest(
+                        peer=input_peer,
+                        offset="",
+                        limit=gift_limit,
+                    )
                 )
             )
+        except FloodWaitError:
+            raise
         except (TypeError, ValueError, RPCError):
             stats["gift_fetch_errors"] += 1
             return 0
@@ -540,33 +547,49 @@ class TelegramChannelCollector:
         return await self._with_resilient_call(func, *args, **kwargs)
 
     async def _ensure_connected(self) -> None:
-        try:
-            if not self._client.is_connected():
-                await self._client.connect()
-        except Exception:
-            try:
-                await self._disconnect()
-            except Exception:
-                pass
-            await self._client.connect()
+        await self._pool.ensure_connected()
 
-    async def _with_resilient_call(self, func, *args, attempts: int = 4, **kwargs):
-        """Retry FloodWait (short) and transient network failures with reconnect."""
+    async def _with_resilient_call(self, func, *args, attempts: int = 6, **kwargs):
+        """Retry short FloodWait; on long FloodWait rotate to another account and retry.
+
+        `func` should re-read the active client when possible (e.g. lambdas using self._client).
+        """
         last_exc: BaseException | None = None
-        for attempt in range(attempts):
+        switch_threshold = int(getattr(self._settings, "flood_switch_threshold_seconds", 60) or 60)
+        sleep_limit = int(getattr(self._settings, "flood_sleep_limit_seconds", 60) or 60)
+        try:
+            pool_size = len(self._pool.list_info())
+        except Exception:
+            pool_size = 1
+        max_attempts = max(attempts, pool_size + 2)
+
+        for attempt in range(max_attempts):
             try:
                 return await func(*args, **kwargs)
             except FloodWaitError as exc:
                 last_exc = exc
-                if exc.seconds > self._settings.flood_sleep_limit_seconds:
-                    raise
-                await asyncio.sleep(exc.seconds)
+                # Short wait — sleep on the same account.
+                if exc.seconds <= sleep_limit and exc.seconds <= switch_threshold:
+                    await asyncio.sleep(exc.seconds)
+                    continue
+                # Long wait — quarantine this account and switch.
+                switched = await self._pool.mark_flood_and_rotate(
+                    exc.seconds,
+                    reason=f"FloodWait via {getattr(func, '__name__', type(func).__name__)}",
+                )
+                if switched:
+                    continue
+                wait = self._pool.seconds_until_any_available()
+                if wait is not None and wait <= sleep_limit:
+                    await asyncio.sleep(wait)
+                    if await self._pool.rotate_to_healthy(force=True):
+                        continue
+                raise
             except (TimedOutError, ConnectionError, OSError, asyncio.TimeoutError) as exc:
                 last_exc = exc
                 await self._ensure_connected()
                 await asyncio.sleep(min(2**attempt, 12))
             except RPCError as exc:
-                # Some RPC/network blips are worth a short retry + reconnect.
                 name = type(exc).__name__
                 if name in {"TimedOutError", "ServerError", "TimeoutError", "NetworkMigrateError"} or "timeout" in str(exc).lower():
                     last_exc = exc
@@ -583,7 +606,7 @@ class TelegramChannelCollector:
         username = normalize_channel_identifier(identifier)
         try:
             entity = await self._with_short_flood_retry(
-                self._client.get_entity, username
+                lambda: self._client.get_entity(username)
             )
         except (
             UsernameInvalidError,
@@ -596,7 +619,7 @@ class TelegramChannelCollector:
         ):
             raise ValueError("Это не публичный broadcast-канал Telegram")
         return await self._with_short_flood_retry(
-            self.inspect_channel, entity, matched_query=matched_query
+            lambda: self.inspect_channel(entity, matched_query=matched_query)
         )
 
     async def inspect_channel(
@@ -608,8 +631,10 @@ class TelegramChannelCollector:
     ) -> ChannelReport:
         now = now or datetime.now(timezone.utc)
         input_channel = cast(types.TypeInputChannel, utils.get_input_channel(channel))
-        full = await self._client(
-            functions.channels.GetFullChannelRequest(channel=input_channel)
+        full = await self._with_resilient_call(
+            lambda: self._client(
+                functions.channels.GetFullChannelRequest(channel=input_channel)
+            )
         )
         full_chat = full.full_chat
 
@@ -617,8 +642,8 @@ class TelegramChannelCollector:
         subscribers = getattr(full_chat, "participants_count", None) or getattr(
             channel, "participants_count", None
         )
-        messages = await self._client.get_messages(
-            channel, limit=self._settings.history_limit
+        messages = await self._with_resilient_call(
+            lambda: self._client.get_messages(channel, limit=self._settings.history_limit)
         )
         posts = [
             message
@@ -701,6 +726,13 @@ class TelegramChannelCollector:
             )
         )
         return [chat for chat in result.chats if isinstance(chat, types.Channel)]
+
+    async def _discussion_request(self, source: types.Channel, post: types.Message):
+        return await self._with_resilient_call(
+            lambda: self._client(
+                functions.messages.GetDiscussionMessageRequest(peer=source, msg_id=post.id)
+            )
+        )
 
 
 def _clean_queries(queries: list[str]) -> list[str]:

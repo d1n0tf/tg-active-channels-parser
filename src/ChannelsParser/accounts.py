@@ -1,0 +1,528 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import sqlite3
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+from telethon import TelegramClient
+from telethon.errors import FloodWaitError
+
+from ChannelsParser.config import AppSettings
+from ChannelsParser.proxy import telethon_proxy
+
+logger = logging.getLogger(__name__)
+
+SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_\-]{0,47}$")
+
+
+@dataclass
+class AccountInfo:
+    """Public snapshot of a parser account for UI / status."""
+
+    account_id: str
+    session_path: str
+    label: str
+    enabled: bool
+    cooldown_until: datetime | None
+    last_error: str | None
+    total_flood_waits: int
+    last_used_at: datetime | None
+    is_active: bool = False
+    is_connected: bool = False
+    is_authorized: bool = False
+
+    @property
+    def is_cooling(self) -> bool:
+        if self.cooldown_until is None:
+            return False
+        return self.cooldown_until > datetime.now(timezone.utc)
+
+    @property
+    def status_label(self) -> str:
+        if not self.enabled:
+            return "выключен"
+        if self.is_cooling:
+            left = self.cooldown_until - datetime.now(timezone.utc)  # type: ignore[operator]
+            return f"cooldown {_fmt_delta(left)}"
+        if not self.is_authorized:
+            return "не авторизован"
+        if self.is_active:
+            return "активен"
+        return "готов"
+
+
+@dataclass
+class _AccountSlot:
+    account_id: str
+    session_path: Path
+    label: str
+    enabled: bool = True
+    cooldown_until: datetime | None = None
+    last_error: str | None = None
+    total_flood_waits: int = 0
+    last_used_at: datetime | None = None
+    client: TelegramClient | None = field(default=None, repr=False)
+
+
+class AccountPool:
+    """Pool of Telethon user sessions with FloodWait-aware rotation."""
+
+    def __init__(self, settings: AppSettings) -> None:
+        self._settings = settings
+        self._slots: list[_AccountSlot] = []
+        self._active_id: str | None = None
+        self._lock = asyncio.Lock()
+        self._db_path = settings.database_path
+        self._ensure_table()
+
+    # ------------------------------------------------------------------ setup
+
+    @classmethod
+    def from_settings(cls, settings: AppSettings) -> AccountPool:
+        pool = cls(settings)
+        pool.discover_sessions()
+        return pool
+
+    def _ensure_table(self) -> None:
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS parser_accounts (
+                    account_id TEXT PRIMARY KEY,
+                    session_path TEXT NOT NULL,
+                    label TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    cooldown_until TEXT,
+                    last_error TEXT,
+                    total_flood_waits INTEGER NOT NULL DEFAULT 0,
+                    last_used_at TEXT
+                )
+                """
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def discover_sessions(self) -> None:
+        """Load sessions from sessions dir + legacy TELEGRAM_SESSION + DB rows."""
+        settings = self._settings
+        sessions_dir = settings.telegram_sessions_dir
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        found: dict[str, Path] = {}
+
+        # Named sessions in directory (*.session, skip journal files)
+        for path in sorted(sessions_dir.glob("*.session")):
+            if path.name.endswith(".session-journal"):
+                continue
+            slug = path.stem
+            if SLUG_RE.match(slug):
+                found[slug] = path.resolve()
+
+        # Legacy single session path (always register so existing installs keep working)
+        legacy = Path(settings.telegram_session)
+        legacy_resolved = legacy.resolve() if legacy.is_absolute() else (Path.cwd() / legacy).resolve()
+        legacy_slug = "default"
+        if legacy_slug not in found:
+            found[legacy_slug] = legacy_resolved
+
+        # Merge DB state
+        with self._connect() as conn:
+            rows = {
+                row["account_id"]: row
+                for row in conn.execute("SELECT * FROM parser_accounts").fetchall()
+            }
+            for account_id, session_path in found.items():
+                row = rows.get(account_id)
+                label = (row["label"] if row else "") or account_id
+                enabled = bool(row["enabled"]) if row else True
+                cooldown = _parse_dt(row["cooldown_until"]) if row else None
+                last_error = row["last_error"] if row else None
+                floods = int(row["total_flood_waits"]) if row else 0
+                last_used = _parse_dt(row["last_used_at"]) if row else None
+                self._slots.append(
+                    _AccountSlot(
+                        account_id=account_id,
+                        session_path=session_path,
+                        label=label,
+                        enabled=enabled,
+                        cooldown_until=cooldown,
+                        last_error=last_error,
+                        total_flood_waits=floods,
+                        last_used_at=last_used,
+                    )
+                )
+                self._upsert_db(
+                    account_id=account_id,
+                    session_path=str(session_path),
+                    label=label,
+                    enabled=enabled,
+                    cooldown_until=cooldown,
+                    last_error=last_error,
+                    total_flood_waits=floods,
+                    last_used_at=last_used,
+                )
+
+            # Sessions only in DB (path may still exist)
+            for account_id, row in rows.items():
+                if any(s.account_id == account_id for s in self._slots):
+                    continue
+                path = Path(row["session_path"])
+                self._slots.append(
+                    _AccountSlot(
+                        account_id=account_id,
+                        session_path=path,
+                        label=row["label"] or account_id,
+                        enabled=bool(row["enabled"]),
+                        cooldown_until=_parse_dt(row["cooldown_until"]),
+                        last_error=row["last_error"],
+                        total_flood_waits=int(row["total_flood_waits"] or 0),
+                        last_used_at=_parse_dt(row["last_used_at"]),
+                    )
+                )
+
+        if not self._slots:
+            # Ensure at least default slot for first login
+            path = Path(settings.telegram_session)
+            if not path.is_absolute():
+                path = (Path.cwd() / path).resolve()
+            self._slots.append(
+                _AccountSlot(
+                    account_id="default",
+                    session_path=path,
+                    label="default",
+                )
+            )
+            self._upsert_db(
+                account_id="default",
+                session_path=str(path),
+                label="default",
+                enabled=True,
+                cooldown_until=None,
+                last_error=None,
+                total_flood_waits=0,
+                last_used_at=None,
+            )
+
+        self._slots.sort(key=lambda s: s.account_id)
+
+    def _upsert_db(
+        self,
+        *,
+        account_id: str,
+        session_path: str,
+        label: str,
+        enabled: bool,
+        cooldown_until: datetime | None,
+        last_error: str | None,
+        total_flood_waits: int,
+        last_used_at: datetime | None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO parser_accounts(
+                    account_id, session_path, label, enabled, cooldown_until,
+                    last_error, total_flood_waits, last_used_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    session_path = excluded.session_path,
+                    label = excluded.label,
+                    enabled = excluded.enabled,
+                    cooldown_until = excluded.cooldown_until,
+                    last_error = excluded.last_error,
+                    total_flood_waits = excluded.total_flood_waits,
+                    last_used_at = excluded.last_used_at
+                """,
+                (
+                    account_id,
+                    session_path,
+                    label,
+                    1 if enabled else 0,
+                    _iso(cooldown_until),
+                    last_error,
+                    total_flood_waits,
+                    _iso(last_used_at),
+                ),
+            )
+
+    def _persist_slot(self, slot: _AccountSlot) -> None:
+        self._upsert_db(
+            account_id=slot.account_id,
+            session_path=str(slot.session_path),
+            label=slot.label,
+            enabled=slot.enabled,
+            cooldown_until=slot.cooldown_until,
+            last_error=slot.last_error,
+            total_flood_waits=slot.total_flood_waits,
+            last_used_at=slot.last_used_at,
+        )
+
+    # ------------------------------------------------------------------ lifecycle
+
+    def _make_client(self, slot: _AccountSlot) -> TelegramClient:
+        session = str(slot.session_path)
+        # Telethon adds .session itself if not present — path without suffix is fine
+        if session.endswith(".session"):
+            session = session[: -len(".session")]
+        return TelegramClient(
+            session,
+            self._settings.telegram_api_id,
+            self._settings.telegram_api_hash,
+            proxy=telethon_proxy(self._settings.telegram_proxy_url),
+        )
+
+    async def connect(self) -> None:
+        """Connect all enabled accounts; pick first healthy as active."""
+        authorized = 0
+        for slot in self._slots:
+            if not slot.enabled:
+                continue
+            client = self._make_client(slot)
+            try:
+                await client.connect()
+                if await client.is_user_authorized():
+                    me = await client.get_me()
+                    slot.label = _account_label(me) or slot.label
+                    slot.client = client
+                    authorized += 1
+                    self._persist_slot(slot)
+                    logger.info("Account ready: %s (%s)", slot.account_id, slot.label)
+                else:
+                    await _disconnect(client)
+                    slot.last_error = "not authorized"
+                    self._persist_slot(slot)
+                    logger.warning("Account %s session not authorized", slot.account_id)
+            except Exception as exc:
+                slot.last_error = f"{type(exc).__name__}: {exc}"
+                self._persist_slot(slot)
+                logger.warning("Account %s connect failed: %s", slot.account_id, exc)
+                try:
+                    await _disconnect(client)
+                except Exception:
+                    pass
+
+        if authorized == 0:
+            raise RuntimeError(
+                "Нет авторизованных Telegram-аккаунтов для парсинга. "
+                "Добавь: uv run tg-active-channels-login --name acc1"
+            )
+
+        await self.rotate_to_healthy(force=True)
+        if self._active_id is None:
+            raise RuntimeError("Не удалось выбрать активный аккаунт (все в cooldown?)")
+
+    async def close(self) -> None:
+        for slot in self._slots:
+            if slot.client is not None:
+                try:
+                    await _disconnect(slot.client)
+                except Exception:
+                    logger.debug("disconnect %s failed", slot.account_id, exc_info=True)
+                slot.client = None
+
+    # ------------------------------------------------------------------ selection
+
+    @property
+    def client(self) -> TelegramClient:
+        slot = self.active_slot()
+        if slot.client is None:
+            raise RuntimeError(f"Аккаунт {slot.account_id} не подключён")
+        return slot.client
+
+    def active_slot(self) -> _AccountSlot:
+        if self._active_id is None:
+            raise RuntimeError("Нет активного аккаунта")
+        for slot in self._slots:
+            if slot.account_id == self._active_id:
+                return slot
+        raise RuntimeError(f"Активный аккаунт {self._active_id} не найден")
+
+    def list_info(self) -> list[AccountInfo]:
+        now = datetime.now(timezone.utc)
+        result: list[AccountInfo] = []
+        for slot in self._slots:
+            cooldown = slot.cooldown_until
+            if cooldown is not None and cooldown <= now:
+                cooldown = None
+            result.append(
+                AccountInfo(
+                    account_id=slot.account_id,
+                    session_path=str(slot.session_path),
+                    label=slot.label,
+                    enabled=slot.enabled,
+                    cooldown_until=cooldown,
+                    last_error=slot.last_error,
+                    total_flood_waits=slot.total_flood_waits,
+                    last_used_at=slot.last_used_at,
+                    is_active=slot.account_id == self._active_id,
+                    is_connected=slot.client is not None and slot.client.is_connected(),
+                    is_authorized=slot.client is not None,
+                )
+            )
+        return result
+
+    def healthy_slots(self) -> list[_AccountSlot]:
+        now = datetime.now(timezone.utc)
+        out: list[_AccountSlot] = []
+        for slot in self._slots:
+            if not slot.enabled or slot.client is None:
+                continue
+            if slot.cooldown_until is not None and slot.cooldown_until > now:
+                continue
+            # clear expired cooldown
+            if slot.cooldown_until is not None and slot.cooldown_until <= now:
+                slot.cooldown_until = None
+                slot.last_error = None
+                self._persist_slot(slot)
+            out.append(slot)
+        return out
+
+    async def rotate_to_healthy(self, *, force: bool = False, exclude_id: str | None = None) -> bool:
+        """Pick least-recently-used healthy account. Returns False if none available."""
+        async with self._lock:
+            candidates = [s for s in self.healthy_slots() if s.account_id != exclude_id]
+            if not candidates:
+                # try clearing expired cooldowns again
+                candidates = [s for s in self.healthy_slots() if s.account_id != exclude_id]
+            if not candidates:
+                self._active_id = None
+                return False
+
+            if not force and self._active_id is not None:
+                current = next((s for s in candidates if s.account_id == self._active_id), None)
+                if current is not None:
+                    return True
+
+            candidates.sort(key=lambda s: s.last_used_at or datetime.fromtimestamp(0, tz=timezone.utc))
+            chosen = candidates[0]
+            self._active_id = chosen.account_id
+            chosen.last_used_at = datetime.now(timezone.utc)
+            self._persist_slot(chosen)
+            logger.info("Active parser account: %s (%s)", chosen.account_id, chosen.label)
+            return True
+
+    async def mark_flood_and_rotate(self, seconds: int, *, reason: str = "FloodWait") -> bool:
+        """Put current account on cooldown and switch. Returns True if another account is available."""
+        async with self._lock:
+            try:
+                slot = self.active_slot()
+            except RuntimeError:
+                return await self.rotate_to_healthy(force=True)
+
+            until = datetime.now(timezone.utc) + timedelta(seconds=max(1, seconds))
+            slot.cooldown_until = until
+            slot.total_flood_waits += 1
+            slot.last_error = f"{reason}: wait {seconds}s until {until.isoformat()}"
+            self._persist_slot(slot)
+            logger.warning(
+                "Account %s cooldown %ss (until %s)",
+                slot.account_id,
+                seconds,
+                until.isoformat(),
+            )
+            excluded = slot.account_id
+
+        return await self.rotate_to_healthy(force=True, exclude_id=excluded)
+
+    async def ensure_connected(self) -> None:
+        slot = self.active_slot()
+        if slot.client is None:
+            if not await self.rotate_to_healthy(force=True):
+                raise RuntimeError("Нет доступных аккаунтов")
+            slot = self.active_slot()
+        assert slot.client is not None
+        if not slot.client.is_connected():
+            await slot.client.connect()
+
+    def seconds_until_any_available(self) -> int | None:
+        """Min seconds until some enabled authorized account leaves cooldown. None if ready now."""
+        if self.healthy_slots():
+            return None
+        now = datetime.now(timezone.utc)
+        waits: list[float] = []
+        for slot in self._slots:
+            if not slot.enabled or slot.client is None:
+                continue
+            if slot.cooldown_until and slot.cooldown_until > now:
+                waits.append((slot.cooldown_until - now).total_seconds())
+        if not waits:
+            return None
+        return max(1, int(min(waits)))
+
+
+def session_path_for(settings: AppSettings, account_id: str) -> Path:
+    if account_id == "default":
+        path = Path(settings.telegram_session)
+        return path if path.is_absolute() else (Path.cwd() / path).resolve()
+    return (settings.telegram_sessions_dir / f"{account_id}.session").resolve()
+
+
+def validate_account_id(account_id: str) -> str:
+    account_id = account_id.strip()
+    if not SLUG_RE.match(account_id):
+        raise ValueError(
+            "Имя аккаунта: латиница/цифры/_/-, 1–48 символов, например acc1 или work_phone"
+        )
+    return account_id
+
+
+def _account_label(me: Any) -> str | None:
+    username = getattr(me, "username", None)
+    if username:
+        return f"@{username}"
+    phone = getattr(me, "phone", None)
+    if phone:
+        return f"+{phone}" if not str(phone).startswith("+") else str(phone)
+    user_id = getattr(me, "id", None)
+    return str(user_id) if user_id is not None else None
+
+
+async def _disconnect(client: TelegramClient) -> None:
+    result: object = client.disconnect()
+    if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+        await result  # type: ignore[misc]
+
+
+def _iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _parse_dt(value: object) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _fmt_delta(delta: timedelta) -> str:
+    total = max(0, int(delta.total_seconds()))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours >= 24:
+        days, hours = divmod(hours, 24)
+        return f"{days}д {hours}ч"
+    if hours:
+        return f"{hours}ч {minutes}м"
+    if minutes:
+        return f"{minutes}м {secs}с"
+    return f"{secs}с"

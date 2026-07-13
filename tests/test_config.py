@@ -44,6 +44,17 @@ def test_settings_allow_disabling_gift_discovery(monkeypatch: pytest.MonkeyPatch
     assert settings.discovery_gift_limit == 0
 
 
+def test_settings_sessions_dir_and_flood_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_SESSIONS_DIR", "data/my_sessions")
+    monkeypatch.setenv("FLOOD_SWITCH_THRESHOLD_SECONDS", "120")
+
+    settings = AppSettings.from_env(require_bot_token=True)
+
+    assert settings.telegram_sessions_dir.name == "my_sessions"
+    assert settings.flood_switch_threshold_seconds == 120
+
+
 def test_settings_parse_admin_user_ids(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_required_env(monkeypatch)
     monkeypatch.setenv("ADMIN_USER_IDS", "111, 222;333")

@@ -132,11 +132,24 @@ class ChannelStorage:
                 """
             )
             _ensure_column(connection, "allowed_users", "expires_at", "TEXT")
+            _ensure_column(connection, "allowed_users", "renewal_notified_at", "TEXT")
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_allowed_users_created ON allowed_users(created_at DESC)"
             )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_allowed_users_expires ON allowed_users(expires_at)"
+            )
 
     def is_user_allowed(self, user_id: int) -> bool:
+        return self.get_access_expiry(user_id) is not False
+
+    def get_access_expiry(self, user_id: int) -> datetime | None | bool:
+        """Return expires_at for active access.
+
+        - False — no access / expired (and cleaned up)
+        - None — permanent access
+        - datetime — timed access expiry (UTC)
+        """
         now = datetime.now(timezone.utc)
         with self._connect() as connection:
             row = connection.execute(
@@ -151,7 +164,7 @@ class ChannelStorage:
             if expires_at is not None and expires_at <= now:
                 connection.execute("DELETE FROM allowed_users WHERE user_id = ?", (user_id,))
                 return False
-        return True
+            return expires_at
 
     def grant_access(
         self,
@@ -181,7 +194,8 @@ class ChannelStorage:
                 connection.execute(
                     """
                     UPDATE allowed_users
-                    SET granted_by = ?, note = COALESCE(?, note), expires_at = ?, created_at = ?
+                    SET granted_by = ?, note = COALESCE(?, note), expires_at = ?,
+                        created_at = ?, renewal_notified_at = NULL
                     WHERE user_id = ?
                     """,
                     (granted_by, note, expires_at, now_s, user_id),
@@ -189,12 +203,60 @@ class ChannelStorage:
                 return "updated"
             connection.execute(
                 """
-                INSERT INTO allowed_users(user_id, granted_by, note, created_at, expires_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO allowed_users(
+                    user_id, granted_by, note, created_at, expires_at, renewal_notified_at
+                )
+                VALUES (?, ?, ?, ?, ?, NULL)
                 """,
                 (user_id, granted_by, note, now_s, expires_at),
             )
         return "created"
+
+    def list_users_needing_renewal_reminder(
+        self, *, within_hours: float = 12.0
+    ) -> list[tuple[int, datetime]]:
+        """Users with timed access ending within `within_hours` who were not notified yet."""
+        now = datetime.now(timezone.utc)
+        horizon = now + timedelta(hours=within_hours)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM allowed_users
+                WHERE expires_at IS NOT NULL AND expires_at <= ?
+                """,
+                (_dt(now),),
+            )
+            rows = connection.execute(
+                """
+                SELECT user_id, expires_at
+                FROM allowed_users
+                WHERE expires_at IS NOT NULL
+                  AND expires_at > ?
+                  AND expires_at <= ?
+                  AND renewal_notified_at IS NULL
+                ORDER BY expires_at ASC
+                """,
+                (_dt(now), _dt(horizon)),
+            ).fetchall()
+        result: list[tuple[int, datetime]] = []
+        for row in rows:
+            expires = _parse_dt(row["expires_at"])
+            if expires is None:
+                continue
+            result.append((int(row["user_id"]), expires))
+        return result
+
+    def mark_renewal_notified(self, user_id: int) -> None:
+        now = _dt(datetime.now(timezone.utc))
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE allowed_users
+                SET renewal_notified_at = ?
+                WHERE user_id = ?
+                """,
+                (now, user_id),
+            )
 
     def revoke_access(self, user_id: int) -> bool:
         with self._connect() as connection:
