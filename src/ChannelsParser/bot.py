@@ -1999,6 +1999,7 @@ def format_subscription_menu() -> str:
 def format_help() -> str:
     return (
         "🎧 Поддержка и команды\n\n"
+        "🚩 Связаться с администратором - @maxxkireev\n\n"
         "🔎 Поиск\n"
         "/find запрос1, запрос2\n"
         "/presets — готовые вертикали\n"
