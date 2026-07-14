@@ -352,11 +352,15 @@ class TelegramChannelCollector:
             stats["candidates_done"] = min(stats["candidates_total"], stats["candidates_done"] + 1)
             await _notify_progress(progress_callback, stats)
 
-        filtered = [
-            report
-            for report in reports_by_id.values()
-            if matches_filters(report, filters, now=now)
-        ]
+        filtered = []
+        filter_drop = 0
+        for report in reports_by_id.values():
+            if matches_filters(report, filters, now=now):
+                filtered.append(report)
+            else:
+                filter_drop += 1
+        stats["filter_dropped"] = filter_drop
+        stats["filter_passed"] = len(filtered)
         return SearchRunResult(
             reports=sort_reports(filtered, filters),
             total_candidates=len(candidates),

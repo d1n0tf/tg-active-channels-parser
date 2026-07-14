@@ -171,7 +171,9 @@ def format_discovery_stats(result: SearchRunResult) -> str:
         f"ошибки подарков: {stats.get('gift_fetch_errors', 0)}\n"
         f"Кандидаты от имени каналов: {stats.get('channel_commenter_refs', 0)}\n"
         f"Всего кандидатов: {result.total_candidates}, проверено: {result.inspected_channels}, "
-        f"прошло фильтры: {len(result.reports)}"
+        f"пропущено inspect: {result.skipped_channels}, "
+        f"отсеяно фильтрами: {stats.get('filter_dropped', 0)}, "
+        f"в выдаче: {stats.get('filter_passed', len(result.reports))}"
     )
 
 

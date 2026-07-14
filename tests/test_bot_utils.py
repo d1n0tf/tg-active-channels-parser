@@ -178,8 +178,9 @@ def test_discovery_filters_keep_activity_and_relax_profile_filters() -> None:
     assert filters.channel_kind == "any"
     assert filters.audience_bias == "any"
     assert filters.age_group == "any"
-    assert filters.max_last_post_days == 3
-    assert filters.min_activity_score == 55
+    # Discovery widens freshness (at least 30d) and drops score gate.
+    assert filters.max_last_post_days == 30
+    assert filters.min_activity_score == 0.0
 
 
 def test_discovery_filters_apply_explicit_subscriber_range() -> None:
@@ -242,7 +243,8 @@ def test_run_discovery_uses_broad_active_filters() -> None:
         assert collector.filters.channel_kind == "any"
         assert collector.filters.audience_bias == "any"
         assert collector.filters.age_group == "any"
-        assert collector.filters.min_activity_score == 50
+        assert collector.filters.min_activity_score == 0.0
+        assert collector.filters.max_last_post_days >= 30
         assert collector.kwargs["gift_limit"] == 10
         assert collector.kwargs["include_comment_links"] is True
         assert collector.kwargs["include_profile_refs"] is True

@@ -36,8 +36,15 @@ class DiscoveryOptions:
 
 
 def discovery_filters(base: SearchFilters, options: DiscoveryOptions | None = None) -> SearchFilters:
-    """Relax topic/demographic filters for commenter-profile discovery."""
+    """Wide filters for commenter-profile discovery.
+
+    Keeps explicit subscriber range from DiscoveryOptions (wizard/subs).
+    Relaxes niche filters and activity gates so personal/small channels
+    from comments are not dropped like in keyword search.
+    """
     options = options or DiscoveryOptions()
+    # Fresher than panel search is OK, but 7d + score 35 kills most discovery hits.
+    fresh_days = max(int(base.max_last_post_days or 7), 30)
     return replace(
         base,
         min_subscribers=options.min_subscribers,
@@ -46,6 +53,8 @@ def discovery_filters(base: SearchFilters, options: DiscoveryOptions | None = No
         channel_kind="any",
         audience_bias="any",
         age_group="any",
+        min_activity_score=0.0,
+        max_last_post_days=fresh_days,
     )
 
 
