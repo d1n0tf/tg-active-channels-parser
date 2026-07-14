@@ -306,6 +306,7 @@ class AccountPool:
     async def connect(self) -> None:
         """Connect all enabled accounts; pick first healthy as active."""
         authorized = 0
+        now = datetime.now(timezone.utc)
         for slot in self._slots:
             if not slot.enabled:
                 continue
@@ -317,8 +318,22 @@ class AccountPool:
                     slot.label = _account_label(me) or slot.label
                     slot.client = client
                     authorized += 1
+                    # Drop expired cooldowns from previous runs so restart recovers cleanly.
+                    if slot.cooldown_until is not None and slot.cooldown_until <= now:
+                        slot.cooldown_until = None
+                        if slot.last_error and "FloodWait" in (slot.last_error or ""):
+                            slot.last_error = None
                     self._persist_slot(slot)
-                    logger.info("Account ready: %s (%s)", slot.account_id, slot.label)
+                    if slot.cooldown_until is not None and slot.cooldown_until > now:
+                        left = max(1, int((slot.cooldown_until - now).total_seconds()))
+                        logger.info(
+                            "Account ready: %s (%s) [cooldown ~%s]",
+                            slot.account_id,
+                            slot.label,
+                            _fmt_delta(timedelta(seconds=left)),
+                        )
+                    else:
+                        logger.info("Account ready: %s (%s)", slot.account_id, slot.label)
                 else:
                     await _disconnect(client)
                     slot.last_error = "not authorized"
@@ -339,13 +354,52 @@ class AccountPool:
                 "Добавь: uv run tg-active-channels-login --name acc1"
             )
 
-        # Prime default active for UI (not exclusive).
+        self._prime_active_after_connect(authorized=authorized)
+
+    def _prime_active_after_connect(self, *, authorized: int) -> None:
+        """Pick default active after connect. Prefer free healthy; else soonest cooldown."""
         free = self.healthy_slots()
         if free:
             free.sort(key=lambda s: s.last_used_at or datetime.fromtimestamp(0, tz=timezone.utc))
             self._active_id = free[0].account_id
-        else:
-            raise RuntimeError("Не удалось выбрать аккаунт (все в cooldown?)")
+            logger.info(
+                "Active parser account: %s (%s free of %s authorized)",
+                self._active_id,
+                len(free),
+                authorized,
+            )
+            return
+
+        # Authorized but every session still in FloodWait cooldown from DB.
+        # Start the bot anyway — scans will wait until cooldowns expire.
+        now = datetime.now(timezone.utc)
+        cooling = [s for s in self._slots if s.enabled and s.client is not None]
+        cooling.sort(
+            key=lambda s: s.cooldown_until or datetime.fromtimestamp(0, tz=timezone.utc)
+        )
+        self._active_id = cooling[0].account_id if cooling else None
+        parts: list[str] = []
+        for s in cooling:
+            if s.cooldown_until and s.cooldown_until > now:
+                left = max(1, int((s.cooldown_until - now).total_seconds()))
+                parts.append(f"{s.account_id}~{_fmt_delta(timedelta(seconds=left))}")
+            else:
+                parts.append(s.account_id)
+        wait = self.seconds_until_any_available()
+        logger.warning(
+            "All %s authorized account(s) are in cooldown on startup (%s). "
+            "Bot starts; next free slot in ~%ss. "
+            "To force-reset (may re-hit FloodWait): "
+            "sqlite3 %s \"UPDATE parser_accounts SET cooldown_until=NULL, last_error=NULL;\"",
+            authorized,
+            ", ".join(parts[:12]) + ("…" if len(parts) > 12 else ""),
+            wait if wait is not None else "?",
+            self._db_path,
+        )
+        if self._active_id is None:
+            raise RuntimeError(
+                "Не удалось выбрать аккаунт: нет подключённых сессий после connect."
+            )
 
     async def close(self) -> None:
         for slot in self._slots:

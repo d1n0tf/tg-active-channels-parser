@@ -85,6 +85,58 @@ def test_mark_flood_and_rotate_cools_account(tmp_path: Path, monkeypatch: pytest
     asyncio.run(run())
 
 
+def test_prime_active_when_all_cooling(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restart must not crash if all sessions still have FloodWait cooldowns in DB."""
+    settings = _settings(tmp_path, monkeypatch)
+    pool = AccountPool.from_settings(settings)
+    from ChannelsParser.accounts import _AccountSlot
+
+    now = datetime.now(timezone.utc)
+    a = _AccountSlot(
+        account_id="a",
+        session_path=tmp_path / "a.session",
+        label="a",
+        cooldown_until=now + timedelta(hours=1),
+    )
+    b = _AccountSlot(
+        account_id="b",
+        session_path=tmp_path / "b.session",
+        label="b",
+        cooldown_until=now + timedelta(hours=2),
+    )
+    a.client = object()  # type: ignore[assignment]
+    b.client = object()  # type: ignore[assignment]
+    pool._slots = [a, b]
+
+    assert pool.healthy_slots() == []
+    pool._prime_active_after_connect(authorized=2)
+    assert pool._active_id == "a"  # soonest cooldown
+    assert pool.seconds_until_any_available() is not None
+    assert pool.seconds_until_any_available() >= 3500
+
+
+def test_prime_active_prefers_free(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _settings(tmp_path, monkeypatch)
+    pool = AccountPool.from_settings(settings)
+    from ChannelsParser.accounts import _AccountSlot
+
+    now = datetime.now(timezone.utc)
+    a = _AccountSlot(
+        account_id="a",
+        session_path=tmp_path / "a.session",
+        label="a",
+        cooldown_until=now + timedelta(hours=1),
+    )
+    b = _AccountSlot(account_id="b", session_path=tmp_path / "b.session", label="b")
+    a.client = object()  # type: ignore[assignment]
+    b.client = object()  # type: ignore[assignment]
+    pool._slots = [a, b]
+
+    pool._prime_active_after_connect(authorized=2)
+    assert pool._active_id == "b"
+    assert pool.free_account_count() == 1
+
+
 def test_two_parallel_leases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _settings(tmp_path, monkeypatch)
     pool = AccountPool.from_settings(settings)
