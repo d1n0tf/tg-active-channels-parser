@@ -54,7 +54,28 @@ def test_format_scan_history_shows_failed_error() -> None:
         started_at=datetime.now(timezone.utc) - timedelta(minutes=5),
     )
 
-    assert "Ошибка: boom" in format_scan_history([scan])
+    text = format_scan_history([scan], ordinals={scan.scan_id: 7})
+    assert "Ошибка: boom" in text
+    assert "#7" in text
+    assert "семейный бюджет" in text
+
+
+def test_scan_source_label_prefers_channel_for_discover() -> None:
+    from ChannelsParser.formatting import scan_source_label
+
+    scan = ScanRecord(
+        scan_id="x",
+        user_id=1,
+        mode="discover",
+        status="done",
+        queries=["@donor", "posts:200", "comments:on"],
+        filters=SearchFilters(),
+        total_candidates=10,
+        total_reports=3,
+        error=None,
+        started_at=datetime.now(timezone.utc),
+    )
+    assert scan_source_label(scan) == "@donor"
 
 
 def test_format_filter_presets_shows_compact_filter_summary() -> None:

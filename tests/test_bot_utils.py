@@ -83,10 +83,10 @@ def test_parsing_keyboard_has_core_actions() -> None:
 
     buttons = [button.text for row in parsing_keyboard().inline_keyboard for button in row]
 
-    assert "🧩 Пресеты запросов" in buttons
-    assert "🔎 Свой поиск" in buttons
     assert "🔗 Discovery" in buttons
-    assert "🧪 Check канала" in buttons
+    assert "🔎 Свой поиск" in buttons
+    assert "🧩 Пресеты" in buttons
+    assert "🧪 Check" in buttons
 
 
 def test_scan_cancel_keyboard_uses_reference_actions() -> None:
@@ -206,7 +206,10 @@ def test_run_scan_rejects_concurrent_scans() -> None:
 
         assert len(storage.created_scans) == 1
         answers = first_message.answers + second_message.answers
-        assert any("Сейчас уже идет поиск" in answer for answer in answers)
+        assert any(
+            "уже идёт" in answer.lower() or "уже идет" in answer.lower() or "занят" in answer.lower()
+            for answer in answers
+        )
 
     asyncio.run(scenario())
 

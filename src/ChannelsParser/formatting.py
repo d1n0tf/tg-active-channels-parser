@@ -59,25 +59,51 @@ def format_reports(reports: list[ChannelReport], *, limit: int = 10) -> str:
     return "\n\n".join(chunks)
 
 
-def format_scan_history(scans: list[ScanRecord]) -> str:
+def format_scan_history(
+    scans: list[ScanRecord],
+    *,
+    ordinals: dict[str, int] | None = None,
+) -> str:
     if not scans:
         return (
             "🗂 Истории пока нет.\n\n"
-            "Запусти поиск через /find, /discover или /check — и сканы появятся здесь."
+            "Запусти Discovery / поиск / check — сканы появятся здесь.\n"
+            "Нажми кнопку записи, чтобы открыть её результат."
         )
 
-    chunks = ["🗂 Последние сканы:"]
+    chunks = [
+        "🗂 История сканов",
+        "Жми кнопку ниже, чтобы открыть результат записи.",
+        "",
+    ]
     for index, scan in enumerate(scans, start=1):
-        queries = ", ".join(scan.queries[:3]) if scan.queries else "—"
-        if len(scan.queries) > 3:
-            queries += f" и ещё {len(scan.queries) - 3}"
+        ordinal = (ordinals or {}).get(scan.scan_id, index)
+        source = scan_source_label(scan)
         chunks.append(
-            f"{index}. {_mode_label(scan.mode)} · {_status_label(scan.status)} · "
-            f"{scan.total_reports}/{scan.total_candidates}\n"
-            f"{_relative_time(scan.started_at)} · {queries}\n"
-            f"id: {scan.scan_id[:8]}{_scan_error_suffix(scan.error)}"
+            f"#{ordinal} · {_mode_label(scan.mode)} · {_status_label(scan.status)}\n"
+            f"🎯 {source}\n"
+            f"📊 {scan.total_reports} в выдаче / {scan.total_candidates} канд. · "
+            f"{_relative_time(scan.started_at)}"
+            f"{_scan_error_suffix(scan.error)}"
         )
     return "\n\n".join(chunks)
+
+
+def scan_source_label(scan: ScanRecord) -> str:
+    """Human label for history: channel @ or first query."""
+    if not scan.queries:
+        return "—"
+    first = scan.queries[0]
+    if scan.mode in {"discover", "audit"}:
+        return first
+    # search: show first queries compact
+    bits = [q for q in scan.queries[:2] if not q.startswith(("posts:", "comments:", "profile:", "gifts:", "subs:"))]
+    if not bits:
+        bits = scan.queries[:2]
+    text = ", ".join(bits)
+    if len(scan.queries) > 2:
+        text += "…"
+    return text if len(text) <= 48 else text[:45] + "…"
 
 
 def format_scan_done(scan_id: str, total_candidates: int, total_reports: int, errors: list[str]) -> str:

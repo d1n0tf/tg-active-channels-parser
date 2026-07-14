@@ -37,6 +37,7 @@ from ChannelsParser.commands import (
 from ChannelsParser.config import AppSettings, ConfigError
 from ChannelsParser.formatting import (
     RESULTS_PAGE_SIZE,
+    format_compact_channel_entry,
     format_compact_results_page,
     format_discovery_stats,
     format_filter_presets,
@@ -46,6 +47,7 @@ from ChannelsParser.formatting import (
     format_scan_done,
     format_scan_history,
     reports_to_csv,
+    scan_source_label,
     source_label_from_scan,
 )
 from ChannelsParser.models import (
@@ -72,13 +74,79 @@ class DiscoverWizard:
 
 
 class BotState:
+    # Max age before we tell the user the scan is stuck and push cancel.
+    SCAN_STALE_SECONDS = 3 * 60 * 60
+
     def __init__(self, storage: ChannelStorage) -> None:
         self._storage = storage
-        self.scan_lock = asyncio.Lock()
+        # Global gate: one Telethon pool → one scan at a time for the whole bot.
+        self._scan_gate = asyncio.Lock()
+        self._scan_running = False
+        self._scan_owner_id: int | None = None
+        self._scan_started_mono: float | None = None
+        self._scan_mode: str | None = None
         self._scan_cancel_requested = asyncio.Event()
         self._scan_finish_collection_requested = asyncio.Event()
         self._pending_input: dict[int, str] = {}
         self._discover_wizards: dict[int, DiscoverWizard] = {}
+
+    @property
+    def scan_lock(self) -> asyncio.Lock:
+        """Backward-compat for tests that poke scan_lock.locked()."""
+        return self._scan_gate
+
+    def is_scan_running(self) -> bool:
+        return self._scan_running
+
+    def scan_busy_message(self, user_id: int) -> str:
+        mode = self._scan_mode or "поиск"
+        age_m = 0
+        if self._scan_started_mono is not None:
+            age_m = max(0, int((time.monotonic() - self._scan_started_mono) / 60))
+        owner = self._scan_owner_id
+
+        if (
+            self._scan_started_mono is not None
+            and (time.monotonic() - self._scan_started_mono) > self.SCAN_STALE_SECONDS
+        ):
+            self.cancel_scan()
+            return (
+                f"⚠️ Скан «{mode}» висит уже ~{age_m} мин — послал стоп.\n"
+                "Подожди 15–30 сек и попробуй снова.\n"
+                "Или сразу: /stopscan"
+            )
+
+        if owner == user_id:
+            return (
+                f"У тебя уже идёт {mode} (~{age_m} мин).\n"
+                "На прогрессе: «Завершить досрочно» / «Отмена».\n"
+                "Если прогресса нет — /stopscan"
+            )
+        owner_bit = f"id {owner}" if owner is not None else "кто-то"
+        return (
+            f"Парсер сейчас занят ({owner_bit}, {mode}, ~{age_m} мин).\n"
+            "Это не твой скан — подожди окончания.\n"
+            "Срочно остановить: /stopscan"
+        )
+
+    async def begin_scan(self, user_id: int, mode: str) -> str | None:
+        """Try to start a scan. Returns error text if busy, else None."""
+        async with self._scan_gate:
+            if self._scan_running:
+                return self.scan_busy_message(user_id)
+            self._scan_running = True
+            self._scan_owner_id = user_id
+            self._scan_started_mono = time.monotonic()
+            self._scan_mode = mode
+            self.reset_scan_cancel()
+            return None
+
+    def end_scan(self) -> None:
+        self.reset_scan_cancel()
+        self._scan_running = False
+        self._scan_owner_id = None
+        self._scan_started_mono = None
+        self._scan_mode = None
 
     def filters(self, user_id: int) -> SearchFilters:
         return self._storage.get_user_filters(user_id)
@@ -143,6 +211,18 @@ class BotState:
 
     def scan_finish_collection_requested(self) -> bool:
         return self._scan_finish_collection_requested.is_set()
+
+    def request_stop_scan(self) -> str:
+        """User/admin asked to stop whatever is running."""
+        if not self._scan_running:
+            return "Сейчас ничего не крутится."
+        self.cancel_scan()
+        owner = self._scan_owner_id
+        mode = self._scan_mode or "скан"
+        return (
+            f"Стоп для «{mode}» (владелец id {owner}).\n"
+            "Дождётся безопасной точки и отдаст что успел / прервётся."
+        )
 
     def start_discover_wizard(self, user_id: int) -> DiscoverWizard:
         wizard = DiscoverWizard()
@@ -444,10 +524,7 @@ def build_router(
     async def history_message(message: Message) -> None:
         if not message.from_user:
             return
-        scans = storage.list_scans(user_id=message.from_user.id, limit=10)
-        await send_branded(message, 
-            format_scan_history(scans), reply_markup=history_keyboard(bool(scans))
-        )
+        await show_history(message, storage, message.from_user.id, edit=False)
 
     @router.message(Command("export"))
     async def export_message(message: Message) -> None:
@@ -661,9 +738,10 @@ def build_router(
             wizard.min_subscribers = min_s
             wizard.max_subscribers = max_s
             state.clear_pending_input(user_id)
-            await send_branded(message, 
-                format_discover_wizard_sources_step(wizard),
-                reply_markup=discover_wizard_sources_keyboard(wizard),
+            await send_branded(
+                message,
+                format_discover_wizard_gifts_step(wizard),
+                reply_markup=discover_wizard_gifts_keyboard(wizard),
             )
             return
 
@@ -782,8 +860,9 @@ def build_router(
         state.request_input(callback.from_user.id, "discover_channel")
         await _edit_or_answer(
             message,
-            "🔗 Discovery · шаг 1/4\n\n"
-            "Отправь юз или ссылку донорского канала.\n\n"
+            "🔗 Discovery\n\n"
+            "Шаг 1/3 — донорский канал\n\n"
+            "Кинь @username или ссылку t.me/…\n"
             "Пример: @source_channel",
             reply_markup=cancel_input_keyboard(),
         )
@@ -815,7 +894,9 @@ def build_router(
             state.request_input(callback.from_user.id, "discover_posts_custom")
             await _edit_or_answer(
                 message,
-                "🔗 Discovery · посты\n\nОтправь число постов от 1 до 500.",
+                "🔗 Discovery · посты\n\n"
+                "Напиши число последних постов (1–500).\n"
+                "Например: 200",
                 reply_markup=cancel_input_keyboard(),
             )
             await callback.answer()
@@ -851,7 +932,10 @@ def build_router(
             await _edit_or_answer(
                 message,
                 "🔗 Discovery · подписчики\n\n"
-                "Отправь диапазон: `100 5000` или `100-5000` или `any`.",
+                "Напиши диапазон сам, например:\n"
+                "100 5000\n"
+                "1000-5000\n"
+                "any — любые",
                 reply_markup=cancel_input_keyboard(),
             )
             await callback.answer()
@@ -864,67 +948,61 @@ def build_router(
         state.clear_pending_input(callback.from_user.id)
         await _edit_or_answer(
             message,
-            format_discover_wizard_sources_step(wizard),
-            reply_markup=discover_wizard_sources_keyboard(wizard),
+            format_discover_wizard_gifts_step(wizard),
+            reply_markup=discover_wizard_gifts_keyboard(wizard),
         )
         await callback.answer()
 
-    @router.callback_query(F.data.startswith("dw:src:"))
-    async def discover_wizard_sources_callback(callback: CallbackQuery) -> None:
+    @router.callback_query(F.data == "dw:gifts:toggle")
+    async def discover_wizard_gifts_toggle_callback(callback: CallbackQuery) -> None:
         message = _callback_message(callback)
-        if not callback.from_user or message is None or not callback.data:
+        if not callback.from_user or message is None:
             return
         wizard = state.discover_wizard(callback.from_user.id)
         if wizard is None or not wizard.identifier:
             await callback.answer("Визард устарел, начни заново", show_alert=True)
             return
-        key = callback.data.removeprefix("dw:src:")
-        if key == "comments":
-            wizard.include_comment_links = not wizard.include_comment_links
-        elif key == "profile":
-            wizard.include_profile_refs = not wizard.include_profile_refs
-        elif key == "gifts":
-            wizard.include_gifts = not wizard.include_gifts
-        elif key == "start":
-            if not (
-                wizard.include_comment_links
-                or wizard.include_profile_refs
-                or wizard.include_gifts
-            ):
-                await callback.answer("Включи хотя бы один источник", show_alert=True)
-                return
-            options = DiscoveryOptions(
-                include_comment_links=wizard.include_comment_links,
-                include_profile_refs=wizard.include_profile_refs,
-                include_gifts=wizard.include_gifts,
-                min_subscribers=wizard.min_subscribers,
-                max_subscribers=wizard.max_subscribers,
-            )
-            identifier = wizard.identifier
-            post_limit = wizard.post_limit
-            state.clear_discover_wizard(callback.from_user.id)
-            state.clear_pending_input(callback.from_user.id)
-            await callback.answer("Запускаю discovery")
-            await run_discovery(
-                message,
-                identifier or "",
-                post_limit,
-                state,
-                collector,
-                storage,
-                settings,
-                user_id=callback.from_user.id,
-                discovery_options=options,
-            )
-            return
-        else:
-            await callback.answer("Неизвестно", show_alert=True)
-            return
-        await edit_branded(message, 
-            format_discover_wizard_sources_step(wizard),
-            reply_markup=discover_wizard_sources_keyboard(wizard),
+        wizard.include_gifts = not wizard.include_gifts
+        await edit_branded(
+            message,
+            format_discover_wizard_gifts_step(wizard),
+            reply_markup=discover_wizard_gifts_keyboard(wizard),
         )
-        await callback.answer()
+        await callback.answer("Подарки: " + ("вкл" if wizard.include_gifts else "выкл"))
+
+    @router.callback_query(F.data == "dw:start")
+    async def discover_wizard_start_callback(callback: CallbackQuery) -> None:
+        message = _callback_message(callback)
+        if not callback.from_user or message is None:
+            return
+        wizard = state.discover_wizard(callback.from_user.id)
+        if wizard is None or not wizard.identifier:
+            await callback.answer("Визард устарел, начни заново", show_alert=True)
+            return
+        # Comments + profiles always on; only gifts is user-toggled.
+        options = DiscoveryOptions(
+            include_comment_links=True,
+            include_profile_refs=True,
+            include_gifts=wizard.include_gifts,
+            min_subscribers=wizard.min_subscribers,
+            max_subscribers=wizard.max_subscribers,
+        )
+        identifier = wizard.identifier
+        post_limit = wizard.post_limit
+        state.clear_discover_wizard(callback.from_user.id)
+        state.clear_pending_input(callback.from_user.id)
+        await callback.answer("Запускаю…")
+        await run_discovery(
+            message,
+            identifier or "",
+            post_limit,
+            state,
+            collector,
+            storage,
+            settings,
+            user_id=callback.from_user.id,
+            discovery_options=options,
+        )
 
     @router.callback_query(F.data.startswith("results:page:"))
     async def results_page_callback(callback: CallbackQuery) -> None:
@@ -1153,10 +1231,39 @@ def build_router(
         message = _callback_message(callback)
         if not callback.from_user or message is None:
             return
-        scans = storage.list_scans(user_id=callback.from_user.id, limit=10)
-        await send_branded(message, 
-            format_scan_history(scans), reply_markup=history_keyboard(bool(scans))
+        await show_history(message, storage, callback.from_user.id, edit=True)
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("history:open:"))
+    async def history_open_callback(callback: CallbackQuery) -> None:
+        message = _callback_message(callback)
+        if not callback.from_user or message is None or not callback.data:
+            return
+        scan_id = callback.data.removeprefix("history:open:")
+        scan = storage.get_scan(scan_id, user_id=callback.from_user.id)
+        if scan is None:
+            await callback.answer("Запись не найдена", show_alert=True)
+            return
+        if scan.status == "running":
+            await callback.answer("Скан ещё идёт", show_alert=True)
+            return
+        text, markup = build_results_page(
+            storage, scan_id, page=1, user_id=callback.from_user.id
         )
+        if text is None:
+            await callback.answer("Нет данных", show_alert=True)
+            return
+        if scan.total_reports == 0 and storage.count_reports(scan_id) == 0:
+            err = f"\nОшибка: {scan.error}" if scan.error else ""
+            text = (
+                f"📋 ЗАПИСЬ #{storage.scan_ordinal(scan_id)}\n"
+                f"🎯 {scan_source_label(scan)}\n"
+                f"Статус: {scan.status}\n"
+                f"В выдаче: 0 каналов{err}\n\n"
+                "Результатов нет — открой другую запись или запусти новый скан."
+            )
+            markup = history_entry_empty_keyboard(scan_id)
+        await edit_branded(message, text, reply_markup=markup)
         await callback.answer()
 
     @router.callback_query(F.data == "export:last")
@@ -1167,9 +1274,16 @@ def build_router(
         await export_latest(message, storage, callback.from_user.id)
         await callback.answer()
 
+    @router.message(Command("stopscan", "stop"))
+    async def stop_scan_message(message: Message) -> None:
+        if not message.from_user:
+            return
+        text = state.request_stop_scan()
+        await send_branded(message, text)
+
     @router.callback_query(F.data == "scan:finish")
     async def scan_finish_callback(callback: CallbackQuery) -> None:
-        if not state.scan_lock.locked():
+        if not state.is_scan_running():
             await callback.answer("Активного поиска нет")
             return
         state.finish_scan_collection()
@@ -1179,7 +1293,7 @@ def build_router(
 
     @router.callback_query(F.data == "scan:cancel")
     async def scan_cancel_callback(callback: CallbackQuery) -> None:
-        if not state.scan_lock.locked():
+        if not state.is_scan_running():
             await callback.answer("Активного поиска нет")
             return
         state.cancel_scan()
@@ -1376,14 +1490,11 @@ async def run_scan(
     user_id: int,
     title: str | None = None,
 ) -> None:
-    if state.scan_lock.locked():
-        await send_branded(message, 
-            "Сейчас уже идет поиск. Дождись завершения или нажми «Завершить досрочно»."
-        )
+    busy = await state.begin_scan(user_id, "поиск")
+    if busy:
+        await send_branded(message, busy, reply_markup=scan_busy_keyboard())
         return
 
-    await state.scan_lock.acquire()
-    state.reset_scan_cancel()
     try:
         filters = state.filters(user_id)
         scan_id = uuid.uuid4().hex
@@ -1439,8 +1550,7 @@ async def run_scan(
             reply_markup=results_keyboard(bool(reports)),
         )
     finally:
-        state.reset_scan_cancel()
-        state.scan_lock.release()
+        state.end_scan()
 
 
 async def run_discovery(
@@ -1455,14 +1565,11 @@ async def run_discovery(
     user_id: int,
     discovery_options: DiscoveryOptions | None = None,
 ) -> None:
-    if state.scan_lock.locked():
-        await send_branded(message, 
-            "Сейчас уже идет поиск. Дождись завершения или нажми «Завершить досрочно»."
-        )
+    busy = await state.begin_scan(user_id, "discovery")
+    if busy:
+        await send_branded(message, busy, reply_markup=scan_busy_keyboard())
         return
 
-    await state.scan_lock.acquire()
-    state.reset_scan_cancel()
     try:
         discovery_options = discovery_options or DiscoveryOptions()
         filters = discovery_filters(state.filters(user_id), discovery_options)
@@ -1545,36 +1652,115 @@ async def run_discovery(
             await send_branded(message, f"Ошибка discovery: {exc}\nscan_id: {scan_id[:8]}")
             return
 
-        if hasattr(progress_message, "edit_text"):
-            try:
-                await edit_branded(progress_message, 
-                    format_discovery_progress_card(
-                        identifier=identifier,
-                        post_limit=post_limit,
-                        stats=result.stats or {},
-                        started_at=started_at,
-                        discovery_options=discovery_options,
-                        gift_limit=gift_limit,
-                        done=True,
-                    )
-                )
-            except Exception:
-                logging.debug(
-                    "Could not finalize discovery progress message", exc_info=True
-                )
+        stats = result.stats or {}
+        # Prefer filtered count for "done" card so UI matches the list we send.
+        done_stats = {
+            **stats,
+            "reports_found": len(reports),
+            "phase": 2,
+            "candidates_done": stats.get("candidates_total", stats.get("candidates_done", 0)),
+        }
+        try:
+            await edit_branded(
+                progress_message,
+                format_discovery_progress_card(
+                    identifier=identifier,
+                    post_limit=post_limit,
+                    stats=done_stats,
+                    started_at=started_at,
+                    discovery_options=discovery_options,
+                    gift_limit=gift_limit,
+                    done=True,
+                ),
+            )
+        except Exception:
+            logging.debug("Could not finalize discovery progress message", exc_info=True)
 
-        # Compact paginated results (like reference UI). Funnel stats only if errors/warnings.
+        # Always deliver a follow-up (empty / error / list) so "готово" is never silent.
+        await _deliver_discovery_results(
+            message,
+            storage=storage,
+            scan_id=scan_id,
+            user_id=user_id,
+            result=result,
+            reports=reports,
+        )
+    finally:
+        state.end_scan()
+
+
+async def _deliver_discovery_results(
+    message: Message,
+    *,
+    storage: ChannelStorage,
+    scan_id: str,
+    user_id: int,
+    result: object,
+    reports: list,
+) -> None:
+    """Send compact results (or a clear empty/error summary). Never fail silently."""
+    stats = getattr(result, "stats", None) or {}
+    inspected = int(getattr(result, "inspected_channels", 0) or 0)
+    candidates = int(getattr(result, "total_candidates", 0) or 0)
+    skipped = int(getattr(result, "skipped_channels", 0) or 0)
+    dropped = int(stats.get("filter_dropped", 0) or 0)
+    errors = list(getattr(result, "errors", None) or [])
+
+    try:
+        if not reports:
+            lines = [
+                "✅ Discovery завершён",
+                f"scan_id: {scan_id[:8]}",
+                "",
+                f"Кандидатов собрано: {candidates}",
+                f"Проверено: {inspected}",
+                f"Ошибок inspect: {skipped}",
+                f"Отсеяно фильтрами: {dropped}",
+                f"В выдаче: 0",
+                "",
+                "Список пуст после фильтров. Ослабь ПДП в визарде или поставь «Любые».",
+            ]
+            if errors:
+                lines.extend(["", "⚠️ " + "; ".join(errors[:3])])
+            await send_branded(
+                message,
+                "\n".join(lines),
+                reply_markup=results_keyboard(False),
+            )
+            return
+
         text, markup = build_results_page(storage, scan_id, page=1, user_id=user_id)
         if text is None:
-            await send_branded(message, "Скан завершён, но запись не найдена.")
-        else:
-            note = ""
-            if result.errors:
-                note = "\n\n⚠️ " + "; ".join(result.errors[:2])
-            await send_branded(message, text + note, reply_markup=markup)
-    finally:
-        state.reset_scan_cancel()
-        state.scan_lock.release()
+            # Fallback if DB row missing — still dump compact list from memory.
+            text = (
+                f"✅ Discovery · {len(reports)} каналов · scan {scan_id[:8]}\n\n"
+                + "\n\n".join(
+                    format_compact_channel_entry(r) for r in reports[:RESULTS_PAGE_SIZE]
+                )
+            )
+            markup = results_keyboard(True)
+
+        note = ""
+        if dropped:
+            note += f"\n\n(отсеяно фильтрами: {dropped})"
+        if errors:
+            note += "\n⚠️ " + "; ".join(errors[:2])
+
+        body = text + note
+        # Prefer multi-part send for long pages (caption limit 1024 with logo).
+        await answer_long(message, body, reply_markup=markup)
+    except Exception as exc:
+        logging.exception("Failed to deliver discovery results scan_id=%s", scan_id)
+        try:
+            await message.answer(
+                f"✅ Discovery завершён ({len(reports)} каналов), "
+                f"но не смог красиво отправить список.\n"
+                f"{type(exc).__name__}: {exc}\n"
+                f"scan_id: {scan_id[:8]}\n"
+                f"Открой /latest или База → Последние результаты."
+            )
+        except Exception:
+            logging.exception("Even fallback result message failed")
 
 
 async def run_audit(
@@ -1586,13 +1772,11 @@ async def run_audit(
     *,
     user_id: int,
 ) -> None:
-    if state.scan_lock.locked():
-        await send_branded(message, 
-            "Сейчас уже идет поиск. Дождись завершения или нажми «Завершить досрочно»."
-        )
+    busy = await state.begin_scan(user_id, "check")
+    if busy:
+        await send_branded(message, busy, reply_markup=scan_busy_keyboard())
         return
 
-    await state.scan_lock.acquire()
     try:
         filters = state.filters(user_id)
         scan_id = uuid.uuid4().hex
@@ -1623,7 +1807,7 @@ async def run_audit(
             reply_markup=results_keyboard(True),
         )
     finally:
-        state.scan_lock.release()
+        state.end_scan()
 
 
 async def export_latest(
@@ -2032,7 +2216,7 @@ def format_main_menu(
     lines.extend(
         [
             "",
-            "Подсказка: /find ключи, /discover @channel 200, /check @channel",
+            "Подсказка: Парсинг → Discovery (всё по кнопкам).",
             "Статус доступа: /access",
         ]
     )
@@ -2119,11 +2303,12 @@ def format_remaining_duration(delta: timedelta) -> str:
 def format_parsing_menu() -> str:
     return (
         "🧻 Парсинг\n\n"
-        "Выбери сценарий:\n"
-        "• пресет по вертикали — сразу запускает поиск\n"
-        "• свой поиск — вводишь ключевые слова\n"
-        "• discovery — каналы из комментариев донора\n"
-        "• check — карточка одного канала"
+        "🔗 Discovery — по кнопкам: канал → посты → ПДП → подарки\n"
+        "🔎 Свой поиск — ключевые слова\n"
+        "🧩 Пресеты — готовые вертикали\n"
+        "🧪 Check — один канал\n\n"
+        "Фильтры поиска нужны для /find и пресетов, "
+        "не для discovery (там ПДП в визарде)."
     )
 
 
@@ -2194,8 +2379,7 @@ def format_help() -> str:
         "🔎 Поиск\n"
         "/find запрос1, запрос2\n"
         "/presets — готовые вертикали\n"
-        "/discover @channel 200 — или визард в меню «Парсинг»\n"
-        "/discover @channel 200 gifts off subs 100 5000\n"
+        "Discovery: Парсинг → Discovery (кнопки, без команд)\n"
         "/check @channel\n\n"
         "⚙️ Фильтры\n"
         "/filters — панель\n"
@@ -2526,14 +2710,13 @@ def main_keyboard() -> InlineKeyboardMarkup:
 
 def parsing_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="🧩 Пресеты запросов", callback_data="presets")
-    builder.button(text="🔎 Свой поиск", callback_data="prompt:find")
     builder.button(text="🔗 Discovery", callback_data="prompt:discover")
-    builder.button(text="🧪 Check канала", callback_data="prompt:check")
-    builder.button(text="⚙️ Фильтры", callback_data="filters")
-    builder.button(text="💾 Мои пресеты фильтров", callback_data="filterpresets")
+    builder.button(text="🔎 Свой поиск", callback_data="prompt:find")
+    builder.button(text="🧩 Пресеты", callback_data="presets")
+    builder.button(text="🧪 Check", callback_data="prompt:check")
+    builder.button(text="⚙️ Фильтры поиска", callback_data="filters")
     builder.button(text="🏠 В меню", callback_data="menu:main")
-    builder.adjust(1)
+    builder.adjust(1, 2, 1, 1, 1)
     return builder.as_markup()
 
 
@@ -2831,6 +3014,15 @@ def scan_cancel_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def scan_busy_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💾 Завершить досрочно", callback_data="scan:finish")
+    builder.button(text="🛑 Стоп (/stopscan)", callback_data="scan:cancel")
+    builder.button(text="🏠 В меню", callback_data="menu:main")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 # Keep aliases for clarity in discovery progress copy.
 def discovery_control_keyboard() -> InlineKeyboardMarkup:
     return scan_cancel_keyboard()
@@ -2848,16 +3040,69 @@ def results_keyboard(has_results: bool) -> InlineKeyboardMarkup | None:
     return builder.as_markup()
 
 
-def history_keyboard(has_scans: bool) -> InlineKeyboardMarkup | None:
+def history_keyboard(
+    scans: list | bool,
+    storage: ChannelStorage | None = None,
+) -> InlineKeyboardMarkup | None:
+    """Keyboard with one open-button per scan + nav."""
     builder = InlineKeyboardBuilder()
-    if has_scans:
-        builder.button(text="📥 Скачать последний CSV", callback_data="export:last")
-        builder.button(text="📋 Последние результаты", callback_data="latest")
-    builder.button(text="🧻 Парсинг", callback_data="parsing")
-    builder.button(text="⚙️ Фильтры", callback_data="filters")
+    scan_list: list = []
+    if isinstance(scans, list):
+        scan_list = scans
+    elif scans and storage is not None:
+        # legacy bool API — no per-scan buttons
+        pass
+
+    for scan in scan_list[:12]:
+        ordinal = storage.scan_ordinal(scan.scan_id) if storage else 0
+        source = scan_source_label(scan)
+        mode = {"discover": "🔗", "audit": "🧪", "search": "🔎"}.get(scan.mode, "📋")
+        # Telegram button text soft limit ~64 chars
+        title = f"{mode} #{ordinal} {source}"
+        if len(title) > 60:
+            title = title[:57] + "…"
+        count = f" ({scan.total_reports})" if scan.total_reports else ""
+        if len(title) + len(count) <= 64:
+            title = title + count
+        builder.button(text=title, callback_data=f"history:open:{scan.scan_id}")
+
+    if scan_list or scans:
+        builder.button(text="📥 CSV последнего", callback_data="export:last")
+        builder.button(text="📋 Последние", callback_data="latest")
+    builder.button(text="💾 База", callback_data="database")
+    builder.button(text="🏠 В меню", callback_data="menu:main")
+    n = len(scan_list[:12])
+    if n:
+        builder.adjust(*([1] * n), 2, 2)
+    else:
+        builder.adjust(1)
+    return builder.as_markup()
+
+
+def history_entry_empty_keyboard(scan_id: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🗂 К истории", callback_data="history")
+    builder.button(text="🗑 Удалить", callback_data=f"results:del:{scan_id}")
     builder.button(text="🏠 В меню", callback_data="menu:main")
     builder.adjust(1)
     return builder.as_markup()
+
+
+async def show_history(
+    message: Message,
+    storage: ChannelStorage,
+    user_id: int,
+    *,
+    edit: bool,
+) -> None:
+    scans = storage.list_scans(user_id=user_id, limit=12)
+    ordinals = {scan.scan_id: storage.scan_ordinal(scan.scan_id) for scan in scans}
+    text = format_scan_history(scans, ordinals=ordinals)
+    markup = history_keyboard(scans, storage)
+    if edit:
+        await _edit_or_answer(message, text, reply_markup=markup)
+    else:
+        await send_branded(message, text, reply_markup=markup)
 
 
 def _short_num(value: int | None) -> str:
@@ -2872,32 +3117,33 @@ def _short_num(value: int | None) -> str:
 
 def format_discover_wizard_posts_step(wizard: DiscoverWizard) -> str:
     return (
-        "🔗 Discovery · шаг 2/4\n\n"
-        f"Канал: {wizard.identifier}\n"
-        "Сколько последних постов смотреть?"
+        "🔗 Discovery\n\n"
+        "Шаг 2/3 — сколько последних постов смотреть?\n\n"
+        f"Канал: {wizard.identifier}\n\n"
+        "Жми кнопку или «Ввести число»."
     )
 
 
 def format_discover_wizard_subs_step(wizard: DiscoverWizard) -> str:
     return (
-        "🔗 Discovery · шаг 3/4\n\n"
+        "🔗 Discovery\n\n"
+        "Шаг 3/3 — подписчики\n\n"
         f"Канал: {wizard.identifier}\n"
         f"Посты: {wizard.post_limit}\n\n"
-        "Выбери диапазон подписчиков (жёсткий фильтр выдачи):"
+        "Кнопка или «Вручную» (например 100 5000)."
     )
 
 
-def format_discover_wizard_sources_step(wizard: DiscoverWizard) -> str:
+def format_discover_wizard_gifts_step(wizard: DiscoverWizard) -> str:
+    gifts = "ВКЛ" if wizard.include_gifts else "ВЫКЛ"
     return (
-        "🔗 Discovery · шаг 4/4\n\n"
+        "🔗 Discovery · готово к запуску\n\n"
         f"Канал: {wizard.identifier}\n"
         f"Посты: {wizard.post_limit}\n"
-        f"ПДП: {_wizard_subs_label(wizard)}\n\n"
-        "Источники (нажми, чтобы вкл/выкл):\n"
-        f"• Комменты: {_on_off_ru(wizard.include_comment_links)}\n"
-        f"• Профиль: {_on_off_ru(wizard.include_profile_refs)}\n"
-        f"• Подарки: {_on_off_ru(wizard.include_gifts)}\n\n"
-        "Когда готово — «Старт»."
+        f"Подписчики: {_wizard_subs_label(wizard)}\n"
+        f"Подарки: {gifts}\n\n"
+        "Комменты и профили всегда включены.\n"
+        "Жми «Подарки», чтобы переключить, потом «Запустить»."
     )
 
 
@@ -2919,7 +3165,7 @@ def discover_wizard_posts_keyboard() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for n in (50, 100, 200, 300, 500):
         builder.button(text=str(n), callback_data=f"dw:posts:{n}")
-    builder.button(text="Custom", callback_data="dw:posts:custom")
+    builder.button(text="✏️ Ввести число", callback_data="dw:posts:custom")
     builder.button(text="🚫 Отмена", callback_data="input:cancel")
     builder.adjust(3, 2, 1, 1)
     return builder.as_markup()
@@ -2935,7 +3181,7 @@ def discover_wizard_subs_keyboard() -> InlineKeyboardMarkup:
         ("20k-50k", "20000:50000"),
         ("От 50k", "50000:none"),
         ("Любые", "none:none"),
-        ("Custom", "custom"),
+        ("✏️ Вручную", "custom"),
     ]
     for title, raw in options:
         builder.button(text=title, callback_data=f"dw:subs:{raw}")
@@ -2944,21 +3190,13 @@ def discover_wizard_subs_keyboard() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def discover_wizard_sources_keyboard(wizard: DiscoverWizard) -> InlineKeyboardMarkup:
+def discover_wizard_gifts_keyboard(wizard: DiscoverWizard) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(
-        text=f"{'✓ ' if wizard.include_comment_links else ''}Комменты",
-        callback_data="dw:src:comments",
+    gifts_label = (
+        "🎁 Подарки: ВКЛ ✓" if wizard.include_gifts else "🎁 Подарки: ВЫКЛ"
     )
-    builder.button(
-        text=f"{'✓ ' if wizard.include_profile_refs else ''}Профиль",
-        callback_data="dw:src:profile",
-    )
-    builder.button(
-        text=f"{'✓ ' if wizard.include_gifts else ''}Подарки",
-        callback_data="dw:src:gifts",
-    )
-    builder.button(text="🚀 Старт", callback_data="dw:src:start")
+    builder.button(text=gifts_label, callback_data="dw:gifts:toggle")
+    builder.button(text="🚀 Запустить", callback_data="dw:start")
     builder.button(text="🚫 Отмена", callback_data="input:cancel")
     builder.adjust(1)
     return builder.as_markup()
@@ -3042,9 +3280,10 @@ def results_page_keyboard(
     if has_results:
         builder.button(text="📥 CSV", callback_data="export:last")
     builder.button(text="Удалить запись", callback_data=f"results:del:{scan_id}")
+    builder.button(text="🗂 История", callback_data="history")
     builder.button(text="⬅️ Назад", callback_data="database")
     builder.button(text="🏠 В меню", callback_data="menu:main")
-    # row layout: next/prev, csv+delete, back+menu
+    # row layout: next/prev, csv+delete, history/back/menu
     if page < total_pages and page > 1:
         builder.adjust(2, 1, 1, 2)
     elif page < total_pages or page > 1:
