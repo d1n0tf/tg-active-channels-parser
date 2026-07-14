@@ -75,6 +75,17 @@ class TelegramChannelCollector:
     async def search_channels(
         self, queries: list[str], filters: SearchFilters, *, should_stop=None
     ) -> SearchRunResult:
+        lease = await self._pool.acquire()
+        token = self._pool.bind_lease(lease)
+        try:
+            return await self._search_channels_body(queries, filters, should_stop=should_stop)
+        finally:
+            self._pool.unbind_lease(token)
+            await self._pool.release(lease)
+
+    async def _search_channels_body(
+        self, queries: list[str], filters: SearchFilters, *, should_stop=None
+    ) -> SearchRunResult:
         now = datetime.now(timezone.utc)
         reports_by_id: dict[int, ChannelReport] = {}
         total_candidates = 0
@@ -155,6 +166,43 @@ class TelegramChannelCollector:
         )
 
     async def discover_channels_from_comments(
+        self,
+        source_identifier: str,
+        filters: SearchFilters,
+        *,
+        post_limit: int,
+        comments_per_post: int,
+        profile_limit: int,
+        candidate_limit: int,
+        gift_limit: int,
+        include_comment_links: bool = True,
+        include_profile_refs: bool = True,
+        should_stop=None,
+        should_finish_collection=None,
+        progress_callback=None,
+    ) -> SearchRunResult:
+        lease = await self._pool.acquire()
+        token = self._pool.bind_lease(lease)
+        try:
+            return await self._discover_channels_body(
+                source_identifier,
+                filters,
+                post_limit=post_limit,
+                comments_per_post=comments_per_post,
+                profile_limit=profile_limit,
+                candidate_limit=candidate_limit,
+                gift_limit=gift_limit,
+                include_comment_links=include_comment_links,
+                include_profile_refs=include_profile_refs,
+                should_stop=should_stop,
+                should_finish_collection=should_finish_collection,
+                progress_callback=progress_callback,
+            )
+        finally:
+            self._pool.unbind_lease(token)
+            await self._pool.release(lease)
+
+    async def _discover_channels_body(
         self,
         source_identifier: str,
         filters: SearchFilters,
@@ -605,6 +653,24 @@ class TelegramChannelCollector:
         raise last_exc
 
     async def inspect_channel_identifier(
+        self, identifier: str, *, matched_query: str = "manual"
+    ) -> ChannelReport:
+        # Nested inspect during discovery already has a lease; only acquire if none.
+        if self._pool.current_lease() is not None:
+            return await self._inspect_channel_identifier_body(
+                identifier, matched_query=matched_query
+            )
+        lease = await self._pool.acquire()
+        token = self._pool.bind_lease(lease)
+        try:
+            return await self._inspect_channel_identifier_body(
+                identifier, matched_query=matched_query
+            )
+        finally:
+            self._pool.unbind_lease(token)
+            await self._pool.release(lease)
+
+    async def _inspect_channel_identifier_body(
         self, identifier: str, *, matched_query: str = "manual"
     ) -> ChannelReport:
         username = normalize_channel_identifier(identifier)

@@ -181,9 +181,30 @@ def test_search_channels_skips_unexpected_channel_errors() -> None:
     asyncio.run(scenario())
 
 
+class _FakePool:
+    async def acquire(self):
+        return object()
+
+    def bind_lease(self, lease):
+        return object()
+
+    def unbind_lease(self, token):
+        return None
+
+    async def release(self, lease):
+        return None
+
+    def current_lease(self):
+        return object()
+
+    def list_info(self):
+        return []
+
+
 class BrokenCollector(TelegramChannelCollector):
     def __init__(self) -> None:
-        self._settings = SimpleNamespace(flood_sleep_limit_seconds=0)
+        self._settings = SimpleNamespace(flood_sleep_limit_seconds=0, flood_switch_threshold_seconds=60)
+        self._pool = _FakePool()  # type: ignore[assignment]
 
     async def _search_public_chats(self, query: str):
         return [SimpleNamespace(id=1, username="broken", broadcast=True)]
@@ -194,7 +215,8 @@ class BrokenCollector(TelegramChannelCollector):
 
 class GiftOnlyCollector(TelegramChannelCollector):
     def __init__(self) -> None:
-        self._settings = SimpleNamespace(flood_sleep_limit_seconds=0)
+        self._settings = SimpleNamespace(flood_sleep_limit_seconds=0, flood_switch_threshold_seconds=60)
+        self._pool = _FakePool()  # type: ignore[assignment]
 
     async def _collect_gift_refs(self, candidates, sender, *, gift_limit, stats):
         candidates["gift_sender"] = CandidateSource("gift source")

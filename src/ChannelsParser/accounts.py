@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import sqlite3
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,6 +19,9 @@ from ChannelsParser.proxy import telethon_proxy
 logger = logging.getLogger(__name__)
 
 SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_\-]{0,47}$")
+
+# Per-async-task lease so concurrent scans each keep their own Telethon client.
+_lease_var: ContextVar["AccountLease | None"] = ContextVar("parser_account_lease", default=None)
 
 
 @dataclass
@@ -69,13 +73,32 @@ class _AccountSlot:
     client: TelegramClient | None = field(default=None, repr=False)
 
 
+@dataclass
+class AccountLease:
+    """Exclusive right to use one pool account for the duration of a scan/job."""
+
+    pool: AccountPool
+    slot: _AccountSlot
+
+    @property
+    def account_id(self) -> str:
+        return self.slot.account_id
+
+    @property
+    def client(self) -> TelegramClient:
+        if self.slot.client is None:
+            raise RuntimeError(f"Аккаунт {self.slot.account_id} не подключён")
+        return self.slot.client
+
+
 class AccountPool:
-    """Pool of Telethon user sessions with FloodWait-aware rotation."""
+    """Pool of Telethon user sessions with leases + FloodWait rotation."""
 
     def __init__(self, settings: AppSettings) -> None:
         self._settings = settings
         self._slots: list[_AccountSlot] = []
-        self._active_id: str | None = None
+        self._active_id: str | None = None  # last/default for UI
+        self._leased_ids: set[str] = set()
         self._lock = asyncio.Lock()
         self._db_path = settings.database_path
         self._ensure_table()
@@ -316,9 +339,13 @@ class AccountPool:
                 "Добавь: uv run tg-active-channels-login --name acc1"
             )
 
-        await self.rotate_to_healthy(force=True)
-        if self._active_id is None:
-            raise RuntimeError("Не удалось выбрать активный аккаунт (все в cooldown?)")
+        # Prime default active for UI (not exclusive).
+        free = self.healthy_slots()
+        if free:
+            free.sort(key=lambda s: s.last_used_at or datetime.fromtimestamp(0, tz=timezone.utc))
+            self._active_id = free[0].account_id
+        else:
+            raise RuntimeError("Не удалось выбрать аккаунт (все в cooldown?)")
 
     async def close(self) -> None:
         for slot in self._slots:
@@ -328,17 +355,25 @@ class AccountPool:
                 except Exception:
                     logger.debug("disconnect %s failed", slot.account_id, exc_info=True)
                 slot.client = None
+        self._leased_ids.clear()
 
-    # ------------------------------------------------------------------ selection
+    # ------------------------------------------------------------------ leases
 
     @property
     def client(self) -> TelegramClient:
+        """Client for current task lease, or default active slot."""
+        lease = _lease_var.get()
+        if lease is not None:
+            return lease.client
         slot = self.active_slot()
         if slot.client is None:
             raise RuntimeError(f"Аккаунт {slot.account_id} не подключён")
         return slot.client
 
     def active_slot(self) -> _AccountSlot:
+        lease = _lease_var.get()
+        if lease is not None:
+            return lease.slot
         if self._active_id is None:
             raise RuntimeError("Нет активного аккаунта")
         for slot in self._slots:
@@ -353,6 +388,7 @@ class AccountPool:
             cooldown = slot.cooldown_until
             if cooldown is not None and cooldown <= now:
                 cooldown = None
+            leased = slot.account_id in self._leased_ids
             result.append(
                 AccountInfo(
                     account_id=slot.account_id,
@@ -363,12 +399,22 @@ class AccountPool:
                     last_error=slot.last_error,
                     total_flood_waits=slot.total_flood_waits,
                     last_used_at=slot.last_used_at,
-                    is_active=slot.account_id == self._active_id,
-                    is_connected=slot.client is not None and slot.client.is_connected(),
+                    is_active=leased or slot.account_id == self._active_id,
+                    is_connected=slot.client is not None and bool(
+                        getattr(slot.client, "is_connected", lambda: False)()
+                        if callable(getattr(slot.client, "is_connected", None))
+                        else slot.client is not None
+                    ),
                     is_authorized=slot.client is not None,
                 )
             )
         return result
+
+    def free_account_count(self) -> int:
+        return len(self._free_healthy_slots())
+
+    def _free_healthy_slots(self) -> list[_AccountSlot]:
+        return [s for s in self.healthy_slots() if s.account_id not in self._leased_ids]
 
     def healthy_slots(self) -> list[_AccountSlot]:
         now = datetime.now(timezone.utc)
@@ -378,7 +424,6 @@ class AccountPool:
                 continue
             if slot.cooldown_until is not None and slot.cooldown_until > now:
                 continue
-            # clear expired cooldown
             if slot.cooldown_until is not None and slot.cooldown_until <= now:
                 slot.cooldown_until = None
                 slot.last_error = None
@@ -386,43 +431,82 @@ class AccountPool:
             out.append(slot)
         return out
 
-    async def rotate_to_healthy(self, *, force: bool = False, exclude_id: str | None = None) -> bool:
-        """Pick least-recently-used healthy account. Returns False if none available."""
+    async def acquire(self) -> AccountLease:
+        """Lease a free healthy account for this scan (exclusive until release)."""
         async with self._lock:
-            candidates = [s for s in self.healthy_slots() if s.account_id != exclude_id]
+            free = self._free_healthy_slots()
+            if not free:
+                wait = self.seconds_until_any_available()
+                if wait is not None:
+                    raise RuntimeError(
+                        f"Все парсер-аккаунты заняты или в cooldown "
+                        f"(освободится ~через {wait}с). Подожди или добавь сессии."
+                    )
+                raise RuntimeError(
+                    "Нет свободных парсер-аккаунтов. "
+                    "Добавь: uv run tg-active-channels-login --name acc2"
+                )
+            free.sort(key=lambda s: s.last_used_at or datetime.fromtimestamp(0, tz=timezone.utc))
+            slot = free[0]
+            self._leased_ids.add(slot.account_id)
+            slot.last_used_at = datetime.now(timezone.utc)
+            self._active_id = slot.account_id
+            self._persist_slot(slot)
+            logger.info("Lease account %s (%s)", slot.account_id, slot.label)
+            return AccountLease(self, slot)
+
+    async def release(self, lease: AccountLease) -> None:
+        async with self._lock:
+            self._leased_ids.discard(lease.account_id)
+            logger.info("Release account %s", lease.account_id)
+
+    def bind_lease(self, lease: AccountLease) -> Token:
+        return _lease_var.set(lease)
+
+    def unbind_lease(self, token: Token) -> None:
+        _lease_var.reset(token)
+
+    def current_lease(self) -> AccountLease | None:
+        return _lease_var.get()
+
+    async def rotate_to_healthy(self, *, force: bool = False, exclude_id: str | None = None) -> bool:
+        """Legacy helper: pick default active among free healthy slots."""
+        async with self._lock:
+            candidates = [
+                s
+                for s in self.healthy_slots()
+                if s.account_id != exclude_id and s.account_id not in self._leased_ids
+            ]
             if not candidates:
-                # try clearing expired cooldowns again
                 candidates = [s for s in self.healthy_slots() if s.account_id != exclude_id]
             if not candidates:
                 self._active_id = None
                 return False
-
-            if not force and self._active_id is not None:
-                current = next((s for s in candidates if s.account_id == self._active_id), None)
-                if current is not None:
-                    return True
-
             candidates.sort(key=lambda s: s.last_used_at or datetime.fromtimestamp(0, tz=timezone.utc))
             chosen = candidates[0]
             self._active_id = chosen.account_id
             chosen.last_used_at = datetime.now(timezone.utc)
             self._persist_slot(chosen)
-            logger.info("Active parser account: %s (%s)", chosen.account_id, chosen.label)
             return True
 
     async def mark_flood_and_rotate(self, seconds: int, *, reason: str = "FloodWait") -> bool:
-        """Put current account on cooldown and switch. Returns True if another account is available."""
+        """Cooldownoldown the account bound to this task's lease (or default active) and rebind."""
+        lease = _lease_var.get()
         async with self._lock:
-            try:
-                slot = self.active_slot()
-            except RuntimeError:
-                return await self.rotate_to_healthy(force=True)
+            if lease is not None:
+                slot = lease.slot
+            else:
+                try:
+                    slot = self.active_slot()
+                except RuntimeError:
+                    return False
 
             until = datetime.now(timezone.utc) + timedelta(seconds=max(1, seconds))
             slot.cooldown_until = until
             slot.total_flood_waits += 1
             slot.last_error = f"{reason}: wait {seconds}s until {until.isoformat()}"
             self._persist_slot(slot)
+            self._leased_ids.discard(slot.account_id)
             logger.warning(
                 "Account %s cooldown %ss (until %s)",
                 slot.account_id,
@@ -431,30 +515,53 @@ class AccountPool:
             )
             excluded = slot.account_id
 
-        return await self.rotate_to_healthy(force=True, exclude_id=excluded)
+            free = [
+                s
+                for s in self.healthy_slots()
+                if s.account_id != excluded and s.account_id not in self._leased_ids
+            ]
+            if not free:
+                if lease is not None:
+                    # Keep lease pointing at dead slot — caller will fail next call
+                    pass
+                self._active_id = None
+                return False
+
+            free.sort(key=lambda s: s.last_used_at or datetime.fromtimestamp(0, tz=timezone.utc))
+            new_slot = free[0]
+            self._leased_ids.add(new_slot.account_id)
+            new_slot.last_used_at = datetime.now(timezone.utc)
+            self._active_id = new_slot.account_id
+            self._persist_slot(new_slot)
+            if lease is not None:
+                lease.slot = new_slot
+            logger.info("Rotated lease → %s (%s)", new_slot.account_id, new_slot.label)
+            return True
 
     async def ensure_connected(self) -> None:
         slot = self.active_slot()
         if slot.client is None:
-            if not await self.rotate_to_healthy(force=True):
-                raise RuntimeError("Нет доступных аккаунтов")
-            slot = self.active_slot()
-        assert slot.client is not None
+            raise RuntimeError("Нет подключённого аккаунта в lease")
         if not slot.client.is_connected():
             await slot.client.connect()
 
     def seconds_until_any_available(self) -> int | None:
-        """Min seconds until some enabled authorized account leaves cooldown. None if ready now."""
-        if self.healthy_slots():
+        """Min seconds until some free healthy account exists. None if free now."""
+        if self._free_healthy_slots():
             return None
         now = datetime.now(timezone.utc)
         waits: list[float] = []
         for slot in self._slots:
             if not slot.enabled or slot.client is None:
                 continue
+            if slot.account_id in self._leased_ids:
+                continue  # busy with another job — unknown when free
             if slot.cooldown_until and slot.cooldown_until > now:
                 waits.append((slot.cooldown_until - now).total_seconds())
         if not waits:
+            # all leased — unknown; report short retry hint
+            if self._leased_ids:
+                return 30
             return None
         return max(1, int(min(waits)))
 

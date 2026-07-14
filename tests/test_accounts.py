@@ -44,7 +44,6 @@ def test_mark_flood_and_rotate_cools_account(tmp_path: Path, monkeypatch: pytest
     settings = _settings(tmp_path, monkeypatch)
     pool = AccountPool.from_settings(settings)
 
-    # Fake two authorized slots without real Telethon connect
     from ChannelsParser.accounts import _AccountSlot
 
     a = _AccountSlot(account_id="a", session_path=tmp_path / "a.session", label="a")
@@ -57,16 +56,57 @@ def test_mark_flood_and_rotate_cools_account(tmp_path: Path, monkeypatch: pytest
     import asyncio
 
     async def run() -> None:
-        ok = await pool.mark_flood_and_rotate(3600, reason="test")
-        assert ok is True
-        assert pool._active_id == "b"
-        assert a.cooldown_until is not None
-        assert a.cooldown_until > datetime.now(timezone.utc)
-        assert a.total_flood_waits == 1
+        lease = await pool.acquire()
+        assert lease.account_id == "a"
+        token = pool.bind_lease(lease)
+        try:
+            ok = await pool.mark_flood_and_rotate(3600, reason="test")
+            assert ok is True
+            assert lease.account_id == "b"
+            assert a.cooldown_until is not None
+            assert a.total_flood_waits == 1
+            assert pool.free_account_count() == 0  # b leased
+        finally:
+            pool.unbind_lease(token)
+            await pool.release(lease)
 
-        # Cool both → no healthy
-        await pool.mark_flood_and_rotate(7200, reason="test")
-        assert pool.healthy_slots() == []
-        assert pool.seconds_until_any_available() is not None
+        assert pool.free_account_count() == 1  # only b healthy free
+
+        lease2 = await pool.acquire()
+        token2 = pool.bind_lease(lease2)
+        try:
+            ok = await pool.mark_flood_and_rotate(7200, reason="test")
+            assert ok is False
+            assert pool.healthy_slots() == []
+        finally:
+            pool.unbind_lease(token2)
+            await pool.release(lease2)
+
+    asyncio.run(run())
+
+
+def test_two_parallel_leases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _settings(tmp_path, monkeypatch)
+    pool = AccountPool.from_settings(settings)
+    from ChannelsParser.accounts import _AccountSlot
+    import asyncio
+
+    a = _AccountSlot(account_id="a", session_path=tmp_path / "a.session", label="a")
+    b = _AccountSlot(account_id="b", session_path=tmp_path / "b.session", label="b")
+    a.client = object()  # type: ignore[assignment]
+    b.client = object()  # type: ignore[assignment]
+    pool._slots = [a, b]
+
+    async def run() -> None:
+        l1 = await pool.acquire()
+        l2 = await pool.acquire()
+        assert {l1.account_id, l2.account_id} == {"a", "b"}
+        with pytest.raises(RuntimeError, match="свободн|заняты|cooldown"):
+            await pool.acquire()
+        await pool.release(l1)
+        l3 = await pool.acquire()
+        assert l3.account_id == l1.account_id
+        await pool.release(l2)
+        await pool.release(l3)
 
     asyncio.run(run())

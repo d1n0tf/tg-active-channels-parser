@@ -5,7 +5,7 @@ import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -73,80 +73,76 @@ class DiscoverWizard:
     include_gifts: bool = True
 
 
+@dataclass
+class _UserScanJob:
+    mode: str
+    started_mono: float
+    cancel: asyncio.Event = field(default_factory=asyncio.Event)
+    finish_collection: asyncio.Event = field(default_factory=asyncio.Event)
+
+
 class BotState:
     # Max age before we tell the user the scan is stuck and push cancel.
     SCAN_STALE_SECONDS = 3 * 60 * 60
 
     def __init__(self, storage: ChannelStorage) -> None:
         self._storage = storage
-        # Global gate: one Telethon pool → one scan at a time for the whole bot.
+        # Per-user jobs: many users can scan in parallel if the account pool has free slots.
         self._scan_gate = asyncio.Lock()
-        self._scan_running = False
-        self._scan_owner_id: int | None = None
-        self._scan_started_mono: float | None = None
-        self._scan_mode: str | None = None
-        self._scan_cancel_requested = asyncio.Event()
-        self._scan_finish_collection_requested = asyncio.Event()
+        self._user_jobs: dict[int, _UserScanJob] = {}
         self._pending_input: dict[int, str] = {}
         self._discover_wizards: dict[int, DiscoverWizard] = {}
 
     @property
     def scan_lock(self) -> asyncio.Lock:
-        """Backward-compat for tests that poke scan_lock.locked()."""
+        """Compat: locked() ≈ any scan running (tests)."""
         return self._scan_gate
 
-    def is_scan_running(self) -> bool:
-        return self._scan_running
+    def is_scan_running(self, user_id: int | None = None) -> bool:
+        if user_id is None:
+            return bool(self._user_jobs)
+        return user_id in self._user_jobs
+
+    def _job(self, user_id: int) -> _UserScanJob | None:
+        return self._user_jobs.get(user_id)
 
     def scan_busy_message(self, user_id: int) -> str:
-        mode = self._scan_mode or "поиск"
-        age_m = 0
-        if self._scan_started_mono is not None:
-            age_m = max(0, int((time.monotonic() - self._scan_started_mono) / 60))
-        owner = self._scan_owner_id
-
-        if (
-            self._scan_started_mono is not None
-            and (time.monotonic() - self._scan_started_mono) > self.SCAN_STALE_SECONDS
-        ):
-            self.cancel_scan()
+        job = self._user_jobs.get(user_id)
+        if job is None:
             return (
-                f"⚠️ Скан «{mode}» висит уже ~{age_m} мин — послал стоп.\n"
+                "Сейчас нет твоего активного скана.\n"
+                "Если парсер занят — у всех аккаунтов cooldown; подожди или /stopscan."
+            )
+        age_m = max(0, int((time.monotonic() - job.started_mono) / 60))
+        if (time.monotonic() - job.started_mono) > self.SCAN_STALE_SECONDS:
+            job.cancel.set()
+            job.finish_collection.set()
+            return (
+                f"⚠️ Твой «{job.mode}» висит ~{age_m} мин — послал стоп.\n"
                 "Подожди 15–30 сек и попробуй снова.\n"
-                "Или сразу: /stopscan"
+                "Или: /stopscan"
             )
-
-        if owner == user_id:
-            return (
-                f"У тебя уже идёт {mode} (~{age_m} мин).\n"
-                "На прогрессе: «Завершить досрочно» / «Отмена».\n"
-                "Если прогресса нет — /stopscan"
-            )
-        owner_bit = f"id {owner}" if owner is not None else "кто-то"
         return (
-            f"Парсер сейчас занят ({owner_bit}, {mode}, ~{age_m} мин).\n"
-            "Это не твой скан — подожди окончания.\n"
-            "Срочно остановить: /stopscan"
+            f"У тебя уже идёт {job.mode} (~{age_m} мин).\n"
+            "На прогрессе: «Завершить досрочно» / «Отмена».\n"
+            "Если прогресса нет — /stopscan"
         )
 
     async def begin_scan(self, user_id: int, mode: str) -> str | None:
-        """Try to start a scan. Returns error text if busy, else None."""
+        """Start per-user scan. Parallel across users; one job per user."""
         async with self._scan_gate:
-            if self._scan_running:
+            if user_id in self._user_jobs:
                 return self.scan_busy_message(user_id)
-            self._scan_running = True
-            self._scan_owner_id = user_id
-            self._scan_started_mono = time.monotonic()
-            self._scan_mode = mode
-            self.reset_scan_cancel()
+            job = _UserScanJob(mode=mode, started_mono=time.monotonic())
+            self._user_jobs[user_id] = job
             return None
 
-    def end_scan(self) -> None:
-        self.reset_scan_cancel()
-        self._scan_running = False
-        self._scan_owner_id = None
-        self._scan_started_mono = None
-        self._scan_mode = None
+    def end_scan(self, user_id: int | None = None) -> None:
+        if user_id is None:
+            # Clear all (legacy) — prefer explicit user_id
+            self._user_jobs.clear()
+            return
+        self._user_jobs.pop(user_id, None)
 
     def filters(self, user_id: int) -> SearchFilters:
         return self._storage.get_user_filters(user_id)
@@ -193,35 +189,57 @@ class BotState:
         if self.is_waiting_for_filter_preset_title(user_id):
             self.clear_pending_input(user_id)
 
-    def reset_scan_cancel(self) -> None:
-        self._scan_cancel_requested.clear()
-        self._scan_finish_collection_requested.clear()
+    def finish_scan_collection(self, user_id: int | None = None) -> None:
+        """Soft stop for one user (or all if user_id is None)."""
+        if user_id is not None:
+            job = self._user_jobs.get(user_id)
+            if job:
+                job.finish_collection.set()
+            return
+        for job in self._user_jobs.values():
+            job.finish_collection.set()
 
-    def finish_scan_collection(self) -> None:
-        """Soft stop: end post/comment browsing, still inspect collected candidates."""
-        self._scan_finish_collection_requested.set()
+    def cancel_scan(self, user_id: int | None = None) -> None:
+        """Hard stop for one user (or all)."""
+        if user_id is not None:
+            job = self._user_jobs.get(user_id)
+            if job:
+                job.cancel.set()
+                job.finish_collection.set()
+            return
+        for job in self._user_jobs.values():
+            job.cancel.set()
+            job.finish_collection.set()
 
-    def cancel_scan(self) -> None:
-        """Hard stop: abort browsing and candidate inspection ASAP."""
-        self._scan_cancel_requested.set()
-        self._scan_finish_collection_requested.set()
+    def scan_cancelled(self, user_id: int | None = None) -> bool:
+        if user_id is None:
+            return any(j.cancel.is_set() for j in self._user_jobs.values())
+        job = self._user_jobs.get(user_id)
+        return bool(job and job.cancel.is_set())
 
-    def scan_cancelled(self) -> bool:
-        return self._scan_cancel_requested.is_set()
+    def scan_finish_collection_requested(self, user_id: int | None = None) -> bool:
+        if user_id is None:
+            return any(j.finish_collection.is_set() for j in self._user_jobs.values())
+        job = self._user_jobs.get(user_id)
+        return bool(job and job.finish_collection.is_set())
 
-    def scan_finish_collection_requested(self) -> bool:
-        return self._scan_finish_collection_requested.is_set()
-
-    def request_stop_scan(self) -> str:
-        """User/admin asked to stop whatever is running."""
-        if not self._scan_running:
+    def request_stop_scan(self, user_id: int | None = None) -> str:
+        """Stop own scan, or all scans if no user / admin wants global stop."""
+        if not self._user_jobs:
             return "Сейчас ничего не крутится."
-        self.cancel_scan()
-        owner = self._scan_owner_id
-        mode = self._scan_mode or "скан"
+        if user_id is not None and user_id in self._user_jobs:
+            job = self._user_jobs[user_id]
+            self.cancel_scan(user_id)
+            return (
+                f"Стоп для твоего «{job.mode}».\n"
+                "Дождётся безопасной точки и отдаст что успел."
+            )
+        # Global stop (command without context of own job, or force)
+        n = len(self._user_jobs)
+        self.cancel_scan(None)
         return (
-            f"Стоп для «{mode}» (владелец id {owner}).\n"
-            "Дождётся безопасной точки и отдаст что успел / прервётся."
+            f"Стоп для всех активных сканов ({n}).\n"
+            "Каждый дойдёт до безопасной точки."
         )
 
     def start_discover_wizard(self, user_id: int) -> DiscoverWizard:
@@ -1278,26 +1296,42 @@ def build_router(
     async def stop_scan_message(message: Message) -> None:
         if not message.from_user:
             return
-        text = state.request_stop_scan()
+        # Prefer stop own job; if none, stop all (shared emergency).
+        uid = message.from_user.id
+        if state.is_scan_running(uid):
+            text = state.request_stop_scan(uid)
+        else:
+            text = state.request_stop_scan(None)
         await send_branded(message, text)
 
     @router.callback_query(F.data == "scan:finish")
     async def scan_finish_callback(callback: CallbackQuery) -> None:
-        if not state.is_scan_running():
+        if not callback.from_user or not state.is_scan_running(callback.from_user.id):
+            # Allow finishing any running scan if this user has none (helper on busy card)
+            if state.is_scan_running():
+                state.finish_scan_collection(None)
+                await callback.answer("Завершаю активный скан…")
+                return
             await callback.answer("Активного поиска нет")
             return
-        state.finish_scan_collection()
+        state.finish_scan_collection(callback.from_user.id)
         await callback.answer(
             "Завершаю обход постов, дальше обработаю найденных кандидатов"
         )
 
     @router.callback_query(F.data == "scan:cancel")
     async def scan_cancel_callback(callback: CallbackQuery) -> None:
-        if not state.is_scan_running():
-            await callback.answer("Активного поиска нет")
+        if not callback.from_user:
             return
-        state.cancel_scan()
-        await callback.answer("Останавливаю полностью")
+        if state.is_scan_running(callback.from_user.id):
+            state.cancel_scan(callback.from_user.id)
+            await callback.answer("Останавливаю твой скан")
+            return
+        if state.is_scan_running():
+            state.cancel_scan(None)
+            await callback.answer("Останавливаю все сканы")
+            return
+        await callback.answer("Активного поиска нет")
 
     @router.callback_query(F.data == "filters:reset")
     async def filters_reset_callback(callback: CallbackQuery) -> None:
@@ -1526,7 +1560,8 @@ async def run_scan(
                 queries,
                 filters,
                 should_stop=lambda: (
-                    state.scan_cancelled() or state.scan_finish_collection_requested()
+                    state.scan_cancelled(user_id)
+                    or state.scan_finish_collection_requested(user_id)
                 ),
             )
             reports = result.reports
@@ -1550,7 +1585,7 @@ async def run_scan(
             reply_markup=results_keyboard(bool(reports)),
         )
     finally:
-        state.end_scan()
+        state.end_scan(user_id)
 
 
 async def run_discovery(
@@ -1587,29 +1622,33 @@ async def run_discovery(
         )
         started_at = datetime.now(timezone.utc)
 
-        progress_message = await send_branded(message, 
-            format_discovery_progress_card(
-                identifier=identifier,
-                post_limit=post_limit,
-                stats={},
-                started_at=started_at,
-                discovery_options=discovery_options,
-                gift_limit=gift_limit,
-            ),
+        # Edit wizard/progress message in place — do not spam a second card.
+        progress_card = format_discovery_progress_card(
+            identifier=identifier,
+            post_limit=post_limit,
+            stats={},
+            started_at=started_at,
+            discovery_options=discovery_options,
+            gift_limit=gift_limit,
+        )
+        progress_message = await edit_branded(
+            message,
+            progress_card,
             reply_markup=scan_cancel_keyboard(),
         )
+        if progress_message is None or not isinstance(progress_message, Message):
+            progress_message = message
         last_progress_update = 0.0
 
         async def update_progress(stats: dict[str, int]) -> None:
-            nonlocal last_progress_update
+            nonlocal last_progress_update, progress_message
             now = time.monotonic()
             if now - last_progress_update < 2.0:
                 return
             last_progress_update = now
-            if not hasattr(progress_message, "edit_text"):
-                return
             try:
-                await edit_branded(progress_message, 
+                edited = await edit_branded(
+                    progress_message,
                     format_discovery_progress_card(
                         identifier=identifier,
                         post_limit=post_limit,
@@ -1620,6 +1659,8 @@ async def run_discovery(
                     ),
                     reply_markup=scan_cancel_keyboard(),
                 )
+                if isinstance(edited, Message):
+                    progress_message = edited
             except Exception:
                 logging.debug(
                     "Could not edit discovery progress message", exc_info=True
@@ -1636,8 +1677,10 @@ async def run_discovery(
                 gift_limit=gift_limit,
                 include_comment_links=discovery_options.include_comment_links,
                 include_profile_refs=discovery_options.include_profile_refs,
-                should_stop=state.scan_cancelled,
-                should_finish_collection=state.scan_finish_collection_requested,
+                should_stop=lambda: state.scan_cancelled(user_id),
+                should_finish_collection=lambda: state.scan_finish_collection_requested(
+                    user_id
+                ),
                 progress_callback=update_progress,
             )
             reports = result.reports
@@ -1661,7 +1704,7 @@ async def run_discovery(
             "candidates_done": stats.get("candidates_total", stats.get("candidates_done", 0)),
         }
         try:
-            await edit_branded(
+            edited = await edit_branded(
                 progress_message,
                 format_discovery_progress_card(
                     identifier=identifier,
@@ -1673,20 +1716,23 @@ async def run_discovery(
                     done=True,
                 ),
             )
+            if isinstance(edited, Message):
+                progress_message = edited
         except Exception:
             logging.debug("Could not finalize discovery progress message", exc_info=True)
 
-        # Always deliver a follow-up (empty / error / list) so "готово" is never silent.
+        # Prefer replacing the progress card with the result list (no duplicate bubble).
         await _deliver_discovery_results(
-            message,
+            progress_message,
             storage=storage,
             scan_id=scan_id,
             user_id=user_id,
             result=result,
             reports=reports,
+            prefer_edit=True,
         )
     finally:
-        state.end_scan()
+        state.end_scan(user_id)
 
 
 async def _deliver_discovery_results(
@@ -1697,14 +1743,33 @@ async def _deliver_discovery_results(
     user_id: int,
     result: object,
     reports: list,
+    prefer_edit: bool = False,
 ) -> None:
-    """Send compact results (or a clear empty/error summary). Never fail silently."""
+    """Deliver compact results (or empty summary). Prefer edit-in-place when asked."""
     stats = getattr(result, "stats", None) or {}
     inspected = int(getattr(result, "inspected_channels", 0) or 0)
     candidates = int(getattr(result, "total_candidates", 0) or 0)
     skipped = int(getattr(result, "skipped_channels", 0) or 0)
     dropped = int(stats.get("filter_dropped", 0) or 0)
     errors = list(getattr(result, "errors", None) or [])
+
+    async def _show(text: str, markup: InlineKeyboardMarkup | None) -> None:
+        if prefer_edit and len(text) <= TELEGRAM_CAPTION_LIMIT:
+            try:
+                await edit_branded(message, text, reply_markup=markup)
+                return
+            except Exception:
+                logging.debug("edit results failed, sending new", exc_info=True)
+        if prefer_edit and len(text) > TELEGRAM_CAPTION_LIMIT:
+            # Keep one card: put summary on progress, full list as one follow-up only if needed.
+            try:
+                short = text if len(text) <= TELEGRAM_CAPTION_LIMIT else text[: TELEGRAM_CAPTION_LIMIT - 1] + "…"
+                await edit_branded(message, short, reply_markup=markup)
+                # Rest of pages available via «След.»
+                return
+            except Exception:
+                logging.debug("edit long results failed", exc_info=True)
+        await answer_long(message, text, reply_markup=markup)
 
     try:
         if not reports:
@@ -1722,16 +1787,11 @@ async def _deliver_discovery_results(
             ]
             if errors:
                 lines.extend(["", "⚠️ " + "; ".join(errors[:3])])
-            await send_branded(
-                message,
-                "\n".join(lines),
-                reply_markup=results_keyboard(False),
-            )
+            await _show("\n".join(lines), results_keyboard(False))
             return
 
         text, markup = build_results_page(storage, scan_id, page=1, user_id=user_id)
         if text is None:
-            # Fallback if DB row missing — still dump compact list from memory.
             text = (
                 f"✅ Discovery · {len(reports)} каналов · scan {scan_id[:8]}\n\n"
                 + "\n\n".join(
@@ -1746,9 +1806,7 @@ async def _deliver_discovery_results(
         if errors:
             note += "\n⚠️ " + "; ".join(errors[:2])
 
-        body = text + note
-        # Prefer multi-part send for long pages (caption limit 1024 with logo).
-        await answer_long(message, body, reply_markup=markup)
+        await _show(text + note, markup)
     except Exception as exc:
         logging.exception("Failed to deliver discovery results scan_id=%s", scan_id)
         try:
@@ -1757,7 +1815,7 @@ async def _deliver_discovery_results(
                 f"но не смог красиво отправить список.\n"
                 f"{type(exc).__name__}: {exc}\n"
                 f"scan_id: {scan_id[:8]}\n"
-                f"Открой /latest или База → Последние результаты."
+                f"Открой /latest или База → История."
             )
         except Exception:
             logging.exception("Even fallback result message failed")
@@ -1807,7 +1865,7 @@ async def run_audit(
             reply_markup=results_keyboard(True),
         )
     finally:
-        state.end_scan()
+        state.end_scan(user_id)
 
 
 async def export_latest(

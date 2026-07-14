@@ -132,17 +132,22 @@ def test_parse_user_ids_and_access_control() -> None:
 
 
 def test_bot_state_soft_finish_does_not_hard_cancel() -> None:
+    import asyncio
+
     storage = FakeStorage()
     state = BotState(storage)  # type: ignore
 
-    state.finish_scan_collection()
-    assert state.scan_finish_collection_requested() is True
-    assert state.scan_cancelled() is False
+    async def setup() -> None:
+        assert await state.begin_scan(42, "discovery") is None
 
-    state.reset_scan_cancel()
-    state.cancel_scan()
-    assert state.scan_cancelled() is True
-    assert state.scan_finish_collection_requested() is True
+    asyncio.run(setup())
+    state.finish_scan_collection(42)
+    assert state.scan_finish_collection_requested(42) is True
+    assert state.scan_cancelled(42) is False
+
+    state.cancel_scan(42)
+    assert state.scan_cancelled(42) is True
+    assert state.scan_finish_collection_requested(42) is True
 
 
 def test_parse_discover_args_accepts_source_toggles_and_subscribers() -> None:
