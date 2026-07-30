@@ -18,6 +18,7 @@ from ChannelsParser.collector import (
     normalize_channel_identifier,
 )
 from ChannelsParser.models import SearchFilters
+from telethon.errors import RpcCallFailError
 from telethon import types
 
 
@@ -177,6 +178,41 @@ def test_search_channels_skips_unexpected_channel_errors() -> None:
         assert result.total_candidates == 1
         assert result.skipped_channels == 1
         assert "RuntimeError: boom" in result.errors[0]
+
+    asyncio.run(scenario())
+
+
+def test_resilient_call_retries_server_rpc_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    class RetryCollector(TelegramChannelCollector):
+        def __init__(self) -> None:
+            self._settings = SimpleNamespace(
+                flood_sleep_limit_seconds=0, flood_switch_threshold_seconds=60
+            )
+            self._pool = _FakePool()  # type: ignore[assignment]
+            self.reconnects = 0
+
+        async def _ensure_connected(self) -> None:
+            self.reconnects += 1
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("ChannelsParser.collector.asyncio.sleep", no_sleep)
+    collector = RetryCollector()
+
+    async def scenario() -> None:
+        calls = 0
+
+        async def operation() -> str:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RpcCallFailError(None)
+            return "ok"
+
+        assert await collector._with_resilient_call(operation, attempts=2) == "ok"
+        assert calls == 2
+        assert collector.reconnects == 1
 
     asyncio.run(scenario())
 

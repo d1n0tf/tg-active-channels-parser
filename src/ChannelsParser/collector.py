@@ -15,6 +15,7 @@ from telethon.errors import (
     FloodWaitError,
     MsgIdInvalidError,
     RPCError,
+    ServerError,
     TimedOutError,
     UsernameInvalidError,
     UsernameNotOccupiedError,
@@ -641,9 +642,14 @@ class TelegramChannelCollector:
                 last_exc = exc
                 await self._ensure_connected()
                 await asyncio.sleep(min(2**attempt, 12))
+            except ServerError as exc:
+                last_exc = exc
+                await self._ensure_connected()
+                await asyncio.sleep(min(2**attempt, 12))
+                continue
             except RPCError as exc:
                 name = type(exc).__name__
-                if name in {"TimedOutError", "ServerError", "TimeoutError", "NetworkMigrateError"} or "timeout" in str(exc).lower():
+                if name in {"TimedOutError", "TimeoutError", "NetworkMigrateError"} or "timeout" in str(exc).lower():
                     last_exc = exc
                     await self._ensure_connected()
                     await asyncio.sleep(min(2**attempt, 12))
