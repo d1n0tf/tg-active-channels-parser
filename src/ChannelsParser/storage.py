@@ -417,6 +417,22 @@ class ChannelStorage:
                 (total_candidates, total_reports, now, scan_id),
             )
 
+    def recover_interrupted_scans(self) -> int:
+        """Close scan records left in `running` state by a process restart."""
+        now = _dt(datetime.now(timezone.utc))
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE scans
+                SET status = 'failed',
+                    error = 'Скан прерван перезапуском сервиса. Запусти его повторно.',
+                    finished_at = ?
+                WHERE status = 'running'
+                """,
+                (now,),
+            )
+        return cursor.rowcount
+
     def fail_scan(self, scan_id: str, *, error: str, total_candidates: int = 0, total_reports: int = 0) -> None:
         now = _dt(datetime.now(timezone.utc))
         with self._connect() as connection:
@@ -569,6 +585,11 @@ class ChannelStorage:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._path, timeout=30)
         connection.row_factory = sqlite3.Row
+        # WAL still permits only one writer. A short busy timeout keeps normal
+        # concurrent bot jobs from surfacing a transient "database is locked"
+        # error to a customer while another scan persists its result.
+        connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute("PRAGMA foreign_keys=ON")
         return connection
 
 

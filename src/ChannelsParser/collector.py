@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import re
 from dataclasses import dataclass
 from collections.abc import Iterable, Sequence
@@ -11,12 +12,15 @@ from typing import Any, cast
 
 from telethon import TelegramClient, functions, types, utils
 from telethon.errors import (
+    AuthKeyError,
+    AuthKeyNotFound,
     ChannelInvalidError,
     FloodWaitError,
     MsgIdInvalidError,
     RPCError,
     ServerError,
     TimedOutError,
+    UnauthorizedError,
     UsernameInvalidError,
     UsernameNotOccupiedError,
 )
@@ -27,6 +31,8 @@ from ChannelsParser.config import AppSettings
 from ChannelsParser.models import ChannelReport, SearchFilters, SearchRunResult
 from ChannelsParser.scoring import activity_score, matches_filters, sort_reports
 
+
+logger = logging.getLogger(__name__)
 
 USERNAME_RE = re.compile(r"(?<![\w/])@([A-Za-z][A-Za-z0-9_]{3,31})")
 TELEGRAM_LINK_RE = re.compile(
@@ -271,7 +277,9 @@ class TelegramChannelCollector:
         if not isinstance(source, types.Channel) or not _is_public_broadcast_channel(source):
             raise ValueError("Донор должен быть публичным broadcast-каналом Telegram")
 
-        posts_raw = await self._client.get_messages(source, limit=post_limit)
+        posts_raw = await self._with_resilient_call(
+            lambda: self._client.get_messages(source, limit=post_limit)
+        )
         posts = [message for message in _message_list(posts_raw) if _looks_like_channel_post(message)]
         stats["posts_seen"] = len(posts)
         stats["posts_with_replies"] = sum(1 for message in posts if _comment_count(message) > 0)
@@ -421,7 +429,12 @@ class TelegramChannelCollector:
 
     async def _iter_post_comments(self, source: types.Channel, post: types.Message, *, limit: int, stats: dict[str, int]):
         try:
-            async for comment in self._client.iter_messages(source, reply_to=post.id, limit=limit):
+            comments = await self._with_resilient_call(
+                lambda: self._client.get_messages(
+                    source, reply_to=post.id, limit=limit
+                )
+            )
+            for comment in _message_list(comments):
                 yield comment
             return
         except MsgIdInvalidError:
@@ -433,7 +446,12 @@ class TelegramChannelCollector:
             return
         discussion_peer, discussion_msg_id = discussion
         stats["discussion_posts"] += 1
-        async for comment in self._client.iter_messages(discussion_peer, reply_to=discussion_msg_id, limit=limit):
+        comments = await self._with_resilient_call(
+            lambda: self._client.get_messages(
+                discussion_peer, reply_to=discussion_msg_id, limit=limit
+            )
+        )
+        for comment in _message_list(comments):
             yield comment
 
     async def _discussion_target(self, source: types.Channel, post: types.Message) -> tuple[types.TypeChat, int] | None:
@@ -478,7 +496,7 @@ class TelegramChannelCollector:
             return
         sender = getattr(message, "sender", None)
         if sender is None and hasattr(message, "get_sender"):
-            sender = await message.get_sender()
+            sender = await self._with_resilient_call(message.get_sender)
         if isinstance(sender, types.Channel):
             username = getattr(sender, "username", None)
             if include_comment_links:
@@ -602,7 +620,51 @@ class TelegramChannelCollector:
     async def _ensure_connected(self) -> None:
         await self._pool.ensure_connected()
 
-    async def _with_resilient_call(self, func, *args, attempts: int = 6, **kwargs):
+    async def _recover_from_transient_error(
+        self, exc: BaseException, *, failures_on_account: int
+    ) -> None:
+        """Reconnect once, then quarantine this account and try a spare."""
+        request_timeout = self._request_timeout_seconds()
+        if failures_on_account >= 2:
+            try:
+                if await self._pool.quarantine_active_and_rotate(
+                    reason=f"{type(exc).__name__}: transient Telegram API failure"
+                ):
+                    return
+            except Exception:
+                logger.warning("Could not rotate parser account after %s", type(exc).__name__, exc_info=True)
+
+        try:
+            await asyncio.wait_for(
+                self._pool.reconnect_active(), timeout=request_timeout
+            )
+        except Exception:
+            # Preserve the original Telegram failure for normal retry handling.
+            logger.warning("Could not reconnect parser account after %s", type(exc).__name__, exc_info=True)
+
+    async def _recover_from_unusable_session(self, exc: BaseException) -> bool:
+        try:
+            return await self._pool.disable_active_session(
+                reason=f"{type(exc).__name__}: session must be re-authorized"
+            )
+        except Exception:
+            logger.warning(
+                "Could not disable unusable parser session after %s",
+                type(exc).__name__,
+                exc_info=True,
+            )
+            return False
+
+    def _request_timeout_seconds(self) -> float:
+        """Return a sane bounded timeout even when settings are mocked."""
+        raw = getattr(self._settings, "telegram_request_timeout_seconds", 45)
+        try:
+            timeout = float(raw)
+        except (TypeError, ValueError):
+            return 45.0
+        return min(300.0, max(5.0, timeout))
+
+    async def _with_resilient_call(self, func, *args, attempts: int = 4, **kwargs):
         """Retry short FloodWait; on long FloodWait rotate to another account and retry.
 
         `func` should re-read the active client when possible (e.g. lambdas using self._client).
@@ -610,15 +672,21 @@ class TelegramChannelCollector:
         last_exc: BaseException | None = None
         switch_threshold = int(getattr(self._settings, "flood_switch_threshold_seconds", 60) or 60)
         sleep_limit = int(getattr(self._settings, "flood_sleep_limit_seconds", 60) or 60)
-        try:
-            pool_size = len(self._pool.list_info())
-        except Exception:
-            pool_size = 1
-        max_attempts = max(attempts, pool_size + 2)
+        max_attempts = max(1, min(int(attempts), 4))
+        request_timeout = self._request_timeout_seconds()
+        failed_account_id: str | None = None
+        failures_on_account = 0
 
         for attempt in range(max_attempts):
             try:
-                return await func(*args, **kwargs)
+                # A previous timeout/reconnect can leave this exact task bound
+                # to a disconnected Telethon transport. Check it before every
+                # retry rather than waiting for another opaque RPC failure.
+                await self._ensure_connected()
+                result = func(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    return await asyncio.wait_for(result, timeout=request_timeout)
+                return result
             except FloodWaitError as exc:
                 last_exc = exc
                 # Short wait — sleep on the same account.
@@ -626,10 +694,14 @@ class TelegramChannelCollector:
                     await asyncio.sleep(exc.seconds)
                     continue
                 # Long wait — quarantine this account and switch.
-                switched = await self._pool.mark_flood_and_rotate(
-                    exc.seconds,
-                    reason=f"FloodWait via {getattr(func, '__name__', type(func).__name__)}",
-                )
+                try:
+                    switched = await self._pool.mark_flood_and_rotate(
+                        exc.seconds,
+                        reason=f"FloodWait via {getattr(func, '__name__', type(func).__name__)}",
+                    )
+                except Exception:
+                    logger.warning("Could not rotate parser account after FloodWait", exc_info=True)
+                    switched = False
                 if switched:
                     continue
                 wait = self._pool.seconds_until_any_available()
@@ -640,23 +712,56 @@ class TelegramChannelCollector:
                 raise
             except (TimedOutError, ConnectionError, OSError, asyncio.TimeoutError) as exc:
                 last_exc = exc
-                await self._ensure_connected()
+                failed_account_id, failures_on_account = self._record_account_failure(
+                    failed_account_id, failures_on_account
+                )
+                await self._recover_from_transient_error(
+                    exc, failures_on_account=failures_on_account
+                )
                 await asyncio.sleep(min(2**attempt, 12))
             except ServerError as exc:
                 last_exc = exc
-                await self._ensure_connected()
+                failed_account_id, failures_on_account = self._record_account_failure(
+                    failed_account_id, failures_on_account
+                )
+                await self._recover_from_transient_error(
+                    exc, failures_on_account=failures_on_account
+                )
                 await asyncio.sleep(min(2**attempt, 12))
                 continue
+            except (AuthKeyNotFound, AuthKeyError, UnauthorizedError) as exc:
+                last_exc = exc
+                if await self._recover_from_unusable_session(exc):
+                    continue
+                raise
             except RPCError as exc:
                 name = type(exc).__name__
                 if name in {"TimedOutError", "TimeoutError", "NetworkMigrateError"} or "timeout" in str(exc).lower():
                     last_exc = exc
-                    await self._ensure_connected()
+                    failed_account_id, failures_on_account = self._record_account_failure(
+                        failed_account_id, failures_on_account
+                    )
+                    await self._recover_from_transient_error(
+                        exc, failures_on_account=failures_on_account
+                    )
                     await asyncio.sleep(min(2**attempt, 12))
                     continue
                 raise
         assert last_exc is not None
         raise last_exc
+
+    def _record_account_failure(
+        self, previous_account_id: str | None, previous_count: int
+    ) -> tuple[str | None, int]:
+        """Count consecutive transient failures per leased parser account."""
+        try:
+            lease = self._pool.current_lease()
+            account_id = getattr(lease, "account_id", None)
+        except Exception:
+            account_id = None
+        if account_id != previous_account_id:
+            return account_id, 1
+        return account_id, previous_count + 1
 
     async def inspect_channel_identifier(
         self, identifier: str, *, matched_query: str = "manual"

@@ -19,6 +19,7 @@ from ChannelsParser.proxy import telethon_proxy
 logger = logging.getLogger(__name__)
 
 SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_\-]{0,47}$")
+TRANSIENT_ACCOUNT_COOLDOWN_SECONDS = 2 * 60
 
 # Per-async-task lease so concurrent scans each keep their own Telethon client.
 _lease_var: ContextVar["AccountLease | None"] = ContextVar("parser_account_lease", default=None)
@@ -79,6 +80,12 @@ class AccountLease:
 
     pool: AccountPool
     slot: _AccountSlot
+    # A lease may be rebound to a replacement account. Keep every account it
+    # has owned so cleanup cannot strand the original one in ``_leased_ids``.
+    leased_account_ids: set[str] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        self.leased_account_ids.add(self.slot.account_id)
 
     @property
     def account_id(self) -> str:
@@ -236,6 +243,18 @@ class AccountPool:
             )
 
         self._slots.sort(key=lambda s: s.account_id)
+
+    def reactivate_account(self, account_id: str) -> bool:
+        """Make a successfully re-authorized session eligible for new scans."""
+        for slot in self._slots:
+            if slot.account_id != account_id:
+                continue
+            slot.enabled = True
+            slot.cooldown_until = None
+            slot.last_error = None
+            self._persist_slot(slot)
+            return True
+        return False
 
     def _upsert_db(
         self,
@@ -511,8 +530,11 @@ class AccountPool:
 
     async def release(self, lease: AccountLease) -> None:
         async with self._lock:
-            self._leased_ids.discard(lease.account_id)
-            logger.info("Release account %s", lease.account_id)
+            released_ids = tuple(lease.leased_account_ids)
+            for account_id in released_ids:
+                self._leased_ids.discard(account_id)
+            lease.leased_account_ids.clear()
+            logger.info("Release account(s) %s", ", ".join(released_ids))
 
     def bind_lease(self, lease: AccountLease) -> Token:
         return _lease_var.set(lease)
@@ -524,7 +546,8 @@ class AccountPool:
         return _lease_var.get()
 
     async def rotate_to_healthy(self, *, force: bool = False, exclude_id: str | None = None) -> bool:
-        """Legacy helper: pick default active among free healthy slots."""
+        """Move the current lease (if any) to a free healthy account."""
+        lease = _lease_var.get()
         async with self._lock:
             candidates = [
                 s
@@ -532,12 +555,15 @@ class AccountPool:
                 if s.account_id != exclude_id and s.account_id not in self._leased_ids
             ]
             if not candidates:
-                candidates = [s for s in self.healthy_slots() if s.account_id != exclude_id]
-            if not candidates:
-                self._active_id = None
                 return False
             candidates.sort(key=lambda s: s.last_used_at or datetime.fromtimestamp(0, tz=timezone.utc))
             chosen = candidates[0]
+            if lease is not None:
+                previous = lease.slot
+                self._leased_ids.discard(previous.account_id)
+                self._leased_ids.add(chosen.account_id)
+                lease.slot = chosen
+                lease.leased_account_ids.add(chosen.account_id)
             self._active_id = chosen.account_id
             chosen.last_used_at = datetime.now(timezone.utc)
             self._persist_slot(chosen)
@@ -575,10 +601,14 @@ class AccountPool:
                 if s.account_id != excluded and s.account_id not in self._leased_ids
             ]
             if not free:
+                # The current scan may still attempt a transport reconnect.
+                # Keep this slot exclusively leased until its finally-block
+                # runs; AccountLease now remembers it and releases it safely.
+                # Otherwise its cooldown could expire while this task still
+                # uses the same Telethon client and a second scan would grab it.
                 if lease is not None:
-                    # Keep lease pointing at dead slot — caller will fail next call
-                    pass
-                self._active_id = None
+                    self._leased_ids.add(slot.account_id)
+                self._active_id = slot.account_id
                 return False
 
             free.sort(key=lambda s: s.last_used_at or datetime.fromtimestamp(0, tz=timezone.utc))
@@ -589,7 +619,124 @@ class AccountPool:
             self._persist_slot(new_slot)
             if lease is not None:
                 lease.slot = new_slot
+                lease.leased_account_ids.add(new_slot.account_id)
             logger.info("Rotated lease → %s (%s)", new_slot.account_id, new_slot.label)
+            return True
+
+    async def quarantine_active_and_rotate(
+        self,
+        *,
+        seconds: int = TRANSIENT_ACCOUNT_COOLDOWN_SECONDS,
+        reason: str,
+    ) -> bool:
+        """Temporarily remove the active account and continue on a spare one.
+
+        A Telegram server failure can be tied to one account or route. Without
+        a cooldown the released account is immediately selected by the next
+        scan and the next user receives the identical failure.
+        """
+        lease = _lease_var.get()
+        async with self._lock:
+            if lease is not None:
+                previous = lease.slot
+            else:
+                try:
+                    previous = self.active_slot()
+                except RuntimeError:
+                    return False
+
+            until = datetime.now(timezone.utc) + timedelta(seconds=max(1, seconds))
+            previous.cooldown_until = until
+            previous.last_error = reason
+            self._persist_slot(previous)
+            self._leased_ids.discard(previous.account_id)
+
+            candidates = [
+                slot
+                for slot in self.healthy_slots()
+                if slot.account_id != previous.account_id
+                and slot.account_id not in self._leased_ids
+            ]
+            if not candidates:
+                # See mark_flood_and_rotate: preserve exclusivity until the
+                # current scan exits, then AccountLease.release() frees it.
+                if lease is not None:
+                    self._leased_ids.add(previous.account_id)
+                self._active_id = previous.account_id
+                return False
+
+            candidates.sort(
+                key=lambda slot: slot.last_used_at
+                or datetime.fromtimestamp(0, tz=timezone.utc)
+            )
+            replacement = candidates[0]
+            self._leased_ids.add(replacement.account_id)
+            replacement.last_used_at = datetime.now(timezone.utc)
+            self._active_id = replacement.account_id
+            self._persist_slot(replacement)
+            if lease is not None:
+                lease.slot = replacement
+                lease.leased_account_ids.add(replacement.account_id)
+            logger.warning(
+                "Quarantined account %s until %s; rotated to %s (%s)",
+                previous.account_id,
+                until.isoformat(),
+                replacement.account_id,
+                reason,
+            )
+            return True
+
+    async def disable_active_session(self, *, reason: str) -> bool:
+        """Disable a revoked/invalid session until it is re-authorized."""
+        lease = _lease_var.get()
+        async with self._lock:
+            if lease is not None:
+                slot = lease.slot
+            else:
+                try:
+                    slot = self.active_slot()
+                except RuntimeError:
+                    return False
+
+            slot.enabled = False
+            slot.cooldown_until = None
+            slot.last_error = reason
+            self._persist_slot(slot)
+            self._leased_ids.discard(slot.account_id)
+            try:
+                if slot.client is not None:
+                    await _disconnect(slot.client)
+            finally:
+                slot.client = None
+
+            candidates = [
+                candidate
+                for candidate in self.healthy_slots()
+                if candidate.account_id != slot.account_id
+                and candidate.account_id not in self._leased_ids
+            ]
+            if not candidates:
+                self._active_id = None
+                return False
+
+            candidates.sort(
+                key=lambda candidate: candidate.last_used_at
+                or datetime.fromtimestamp(0, tz=timezone.utc)
+            )
+            replacement = candidates[0]
+            self._leased_ids.add(replacement.account_id)
+            replacement.last_used_at = datetime.now(timezone.utc)
+            self._active_id = replacement.account_id
+            self._persist_slot(replacement)
+            if lease is not None:
+                lease.slot = replacement
+                lease.leased_account_ids.add(replacement.account_id)
+            logger.error(
+                "Disabled unusable session %s; rotated to %s (%s)",
+                slot.account_id,
+                replacement.account_id,
+                reason,
+            )
             return True
 
     async def ensure_connected(self) -> None:
@@ -598,6 +745,23 @@ class AccountPool:
             raise RuntimeError("Нет подключённого аккаунта в lease")
         if not slot.client.is_connected():
             await slot.client.connect()
+
+    async def reconnect_active(self) -> None:
+        """Recreate the transport for the account used by the current scan.
+
+        Telethon may still report an open socket after a transient Telegram server
+        failure. In that state ``ensure_connected`` is a no-op, so explicitly
+        disconnect before reconnecting.
+        """
+        slot = self.active_slot()
+        if slot.client is None:
+            raise RuntimeError("Нет подключённого аккаунта в lease")
+        await _disconnect(slot.client)
+        await slot.client.connect()
+
+    async def rotate_lease_to_healthy(self, *, reason: str) -> bool:
+        """Backward-compatible alias for transient-error quarantine."""
+        return await self.quarantine_active_and_rotate(reason=reason)
 
     def seconds_until_any_available(self) -> int | None:
         """Min seconds until some free healthy account exists. None if free now."""

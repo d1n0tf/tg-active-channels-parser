@@ -165,6 +165,61 @@ def test_collect_sender_refs_checks_gifts_without_profile_refs() -> None:
     asyncio.run(scenario())
 
 
+def test_collect_sender_refs_uses_resilient_lookup_when_sender_is_missing() -> None:
+    class SenderLookupCollector(GiftOnlyCollector):
+        def __init__(self) -> None:
+            super().__init__()
+            self.resilient_calls = 0
+
+        async def _with_resilient_call(self, func, *args, **kwargs):
+            self.resilient_calls += 1
+            return await func(*args, **kwargs)
+
+    async def scenario() -> None:
+        collector = SenderLookupCollector()
+        sender = types.User(
+            id=42,
+            is_self=False,
+            access_hash=123,
+            first_name="Owner",
+            username="owner_user",
+        )
+
+        class MessageWithoutSender:
+            sender = None
+            message = ""
+
+            async def get_sender(self):
+                return sender
+
+        stats = {
+            "profiles_seen": 0,
+            "profiles_skipped_by_limit": 0,
+            "comment_refs": 0,
+            "bio_refs": 0,
+            "personal_channel_refs": 0,
+            "gift_profiles_checked": 0,
+            "gift_fetch_errors": 0,
+            "gift_refs": 0,
+            "channel_commenter_refs": 0,
+        }
+        await collector._collect_sender_refs(
+            {},
+            MessageWithoutSender(),  # type: ignore[arg-type]
+            seen_sender_ids=set(),
+            limit=10,
+            profile_limit=0,
+            gift_limit=0,
+            include_comment_links=False,
+            include_profile_refs=False,
+            stats=stats,
+        )
+
+        assert collector.resilient_calls == 1
+
+    asyncio.run(scenario())
+
+
 def test_peer_id_value_reads_channel_peer() -> None:
     assert _peer_id_value(types.PeerChannel(channel_id=123)) == 123
 
@@ -191,7 +246,7 @@ def test_resilient_call_retries_server_rpc_error(monkeypatch: pytest.MonkeyPatch
             self._pool = _FakePool()  # type: ignore[assignment]
             self.reconnects = 0
 
-        async def _ensure_connected(self) -> None:
+        async def _recover_from_transient_error(self, exc, *, failures_on_account: int) -> None:
             self.reconnects += 1
 
     async def no_sleep(_: float) -> None:
@@ -217,6 +272,84 @@ def test_resilient_call_retries_server_rpc_error(monkeypatch: pytest.MonkeyPatch
     asyncio.run(scenario())
 
 
+def test_resilient_call_times_out_and_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    class RetryCollector(TelegramChannelCollector):
+        def __init__(self) -> None:
+            self._settings = SimpleNamespace(
+                flood_sleep_limit_seconds=0,
+                flood_switch_threshold_seconds=60,
+                telegram_request_timeout_seconds=1,
+            )
+            self._pool = _FakePool()  # type: ignore[assignment]
+            self.recoveries = 0
+
+        async def _recover_from_transient_error(self, exc, *, failures_on_account: int) -> None:
+            self.recoveries += 1
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("ChannelsParser.collector.asyncio.sleep", no_sleep)
+    collector = RetryCollector()
+
+    async def scenario() -> None:
+        calls = 0
+
+        async def operation() -> str:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise asyncio.TimeoutError()
+            return "ok"
+
+        assert await collector._with_resilient_call(operation, attempts=2) == "ok"
+        assert calls == 2
+        assert collector.recoveries == 1
+
+    asyncio.run(scenario())
+
+
+def test_resilient_call_checks_connection_before_each_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RetryCollector(TelegramChannelCollector):
+        def __init__(self) -> None:
+            self._settings = SimpleNamespace(
+                flood_sleep_limit_seconds=0,
+                flood_switch_threshold_seconds=60,
+                telegram_request_timeout_seconds=1,
+            )
+            self._pool = _FakePool()  # type: ignore[assignment]
+            self.connection_checks = 0
+
+        async def _ensure_connected(self) -> None:
+            self.connection_checks += 1
+
+        async def _recover_from_transient_error(self, exc, *, failures_on_account: int) -> None:
+            return None
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("ChannelsParser.collector.asyncio.sleep", no_sleep)
+    collector = RetryCollector()
+
+    async def scenario() -> None:
+        calls = 0
+
+        async def operation() -> str:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise asyncio.TimeoutError()
+            return "ok"
+
+        assert await collector._with_resilient_call(operation, attempts=2) == "ok"
+        assert collector.connection_checks == 2
+
+    asyncio.run(scenario())
+
+
 class _FakePool:
     async def acquire(self):
         return object()
@@ -235,6 +368,15 @@ class _FakePool:
 
     def list_info(self):
         return []
+
+    async def ensure_connected(self):
+        return None
+
+    async def reconnect_active(self):
+        return None
+
+    async def rotate_lease_to_healthy(self, *, reason: str):
+        return False
 
 
 class BrokenCollector(TelegramChannelCollector):

@@ -48,6 +48,7 @@ async def login(*, account_id: str, phone: str | None) -> None:
 
     # Refresh pool registry so DB knows about the new session
     pool = AccountPool.from_settings(settings)
+    pool.reactivate_account(account_id)
     print(f"Всего аккаунтов в пуле: {len(pool.list_info())}")
     for info in pool.list_info():
         mark = "*" if info.account_id == account_id else " "

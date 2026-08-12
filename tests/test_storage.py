@@ -156,6 +156,19 @@ def test_storage_records_failed_scan(tmp_path) -> None:
     assert scan.total_candidates == 2
 
 
+def test_storage_recovers_interrupted_scans_on_startup(tmp_path) -> None:
+    storage = ChannelStorage(tmp_path / "channels.sqlite3")
+    storage.init()
+    storage.create_scan("interrupted", user_id=42, mode="search", queries=["x"], filters=SearchFilters())
+
+    assert storage.recover_interrupted_scans() == 1
+
+    scan = storage.get_scan("interrupted", user_id=42)
+    assert scan is not None
+    assert scan.status == "failed"
+    assert "перезапуском" in (scan.error or "")
+
+
 def test_storage_falls_back_from_corrupt_filter_json(tmp_path) -> None:
     db_path = tmp_path / "channels.sqlite3"
     storage = ChannelStorage(db_path)

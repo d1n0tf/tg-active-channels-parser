@@ -5,6 +5,7 @@ import io
 from datetime import datetime, timezone
 
 from ChannelsParser.models import ChannelReport, FilterPreset, ScanRecord, SearchFilters, SearchRunResult
+from ChannelsParser.user_errors import scan_errors_text, stored_scan_error_text
 
 
 def format_filters(filters: SearchFilters) -> str:
@@ -112,7 +113,7 @@ def format_scan_done(scan_id: str, total_candidates: int, total_reports: int, er
         f"прошли фильтры.\nscan_id: {scan_id[:8]}"
     )
     if errors:
-        preview = "; ".join(errors[:3])
+        preview = scan_errors_text(errors)
         text += f"\n⚠️ Часть каналов пропущена из-за ошибок Telegram: {preview}"
     return text
 
@@ -390,4 +391,4 @@ def _csv_optional(value: object | None) -> object:
 def _scan_error_suffix(error: str | None) -> str:
     if not error:
         return ""
-    return f"\nОшибка: {error[:160]}"
+    return f"\nОшибка: {stored_scan_error_text(error)}"

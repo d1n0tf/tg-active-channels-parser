@@ -55,7 +55,7 @@ def test_format_scan_history_shows_failed_error() -> None:
     )
 
     text = format_scan_history([scan], ordinals={scan.scan_id: 7})
-    assert "Ошибка: boom" in text
+    assert "Ошибка: Технический сбой" in text
     assert "#7" in text
     assert "семейный бюджет" in text
 

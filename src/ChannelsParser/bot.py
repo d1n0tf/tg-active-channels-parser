@@ -16,6 +16,7 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    ErrorEvent,
     FSInputFile,
     InlineKeyboardMarkup,
     Message,
@@ -60,6 +61,7 @@ from ChannelsParser.presets import QUERY_PRESETS, get_preset
 from ChannelsParser.proxy import aiogram_proxy
 from ChannelsParser.scoring import matches_filters
 from ChannelsParser.storage import ChannelStorage
+from ChannelsParser.user_errors import operation_error_text, scan_errors_text, stored_scan_error_text
 
 
 @dataclass
@@ -268,6 +270,9 @@ async def run_bot() -> None:
     settings = AppSettings.from_env(require_bot_token=True)
     storage = ChannelStorage(settings.database_path)
     storage.init()
+    recovered = storage.recover_interrupted_scans()
+    if recovered:
+        logging.warning("Marked %s interrupted scan(s) as failed on startup", recovered)
 
     collector = TelegramChannelCollector(settings)
     await collector.connect()
@@ -348,6 +353,31 @@ def build_router(
     access = AccessControl(settings, storage)
     router.message.middleware(AccessMiddleware(access))
     router.callback_query.middleware(AccessMiddleware(access))
+
+    @router.errors()
+    async def unhandled_update_error(event: ErrorEvent) -> bool:
+        """Keep unexpected handler failures visible to us but safe for users."""
+        logging.error(
+            "Unhandled bot update error: %s",
+            type(event.exception).__name__,
+            exc_info=(
+                type(event.exception),
+                event.exception,
+                event.exception.__traceback__,
+            ),
+        )
+        message = _error_event_message(event)
+        if message is not None:
+            try:
+                await send_branded(
+                    message,
+                    "⚠️ Не удалось обработать это действие.\n"
+                    f"{operation_error_text(event.exception)}",
+                    reply_markup=main_keyboard(),
+                )
+            except Exception:
+                logging.exception("Could not deliver fallback error message")
+        return True
 
     @router.message(Command("allow"))
     async def allow_message(message: Message, command: CommandObject) -> None:
@@ -1272,7 +1302,8 @@ def build_router(
             await callback.answer("Нет данных", show_alert=True)
             return
         if scan.total_reports == 0 and storage.count_reports(scan_id) == 0:
-            err = f"\nОшибка: {scan.error}" if scan.error else ""
+            error_text = stored_scan_error_text(scan.error)
+            err = f"\nОшибка: {error_text}" if error_text else ""
             text = (
                 f"📋 ЗАПИСЬ #{storage.scan_ordinal(scan_id)}\n"
                 f"🎯 {scan_source_label(scan)}\n"
@@ -1572,8 +1603,12 @@ async def run_scan(
                 total_reports=len(reports),
             )
         except Exception as exc:
+            logging.exception("Search scan failed scan_id=%s", scan_id)
             storage.fail_scan(scan_id, error=str(exc))
-            await send_branded(message, f"Ошибка поиска: {exc}\nscan_id: {scan_id[:8]}")
+            await send_branded(
+                message,
+                f"❌ Поиск не завершился\n{operation_error_text(exc)}\nscan_id: {scan_id[:8]}",
+            )
             return
 
         summary = format_scan_done(
@@ -1691,8 +1726,12 @@ async def run_discovery(
                 total_reports=len(reports),
             )
         except Exception as exc:
+            logging.exception("Discovery scan failed scan_id=%s", scan_id)
             storage.fail_scan(scan_id, error=str(exc))
-            await send_branded(message, f"Ошибка discovery: {exc}\nscan_id: {scan_id[:8]}")
+            await send_branded(
+                message,
+                f"❌ Discovery не завершён\n{operation_error_text(exc)}\nscan_id: {scan_id[:8]}",
+            )
             return
 
         stats = result.stats or {}
@@ -1786,7 +1825,7 @@ async def _deliver_discovery_results(
                 "Список пуст после фильтров. Ослабь ПДП в визарде или поставь «Любые».",
             ]
             if errors:
-                lines.extend(["", "⚠️ " + "; ".join(errors[:3])])
+                lines.extend(["", "⚠️ " + scan_errors_text(errors)])
             await _show("\n".join(lines), results_keyboard(False))
             return
 
@@ -1804,7 +1843,7 @@ async def _deliver_discovery_results(
         if dropped:
             note += f"\n\n(отсеяно фильтрами: {dropped})"
         if errors:
-            note += "\n⚠️ " + "; ".join(errors[:2])
+            note += "\n⚠️ " + scan_errors_text(errors, limit=2)
 
         await _show(text + note, markup)
     except Exception as exc:
@@ -1813,7 +1852,6 @@ async def _deliver_discovery_results(
             await message.answer(
                 f"✅ Discovery завершён ({len(reports)} каналов), "
                 f"но не смог красиво отправить список.\n"
-                f"{type(exc).__name__}: {exc}\n"
                 f"scan_id: {scan_id[:8]}\n"
                 f"Открой /latest или База → История."
             )
@@ -1852,8 +1890,12 @@ async def run_audit(
             storage.save_reports(scan_id, [report])
             storage.finish_scan(scan_id, total_candidates=1, total_reports=1)
         except Exception as exc:
+            logging.exception("Audit scan failed scan_id=%s", scan_id)
             storage.fail_scan(scan_id, error=str(exc), total_candidates=1)
-            await send_branded(message, f"❌ Ошибка проверки: {exc}\nscan_id: {scan_id[:8]}")
+            await send_branded(
+                message,
+                f"❌ Проверка не завершилась\n{operation_error_text(exc)}\nscan_id: {scan_id[:8]}",
+            )
             return
 
         passes = matches_filters(report, filters)
@@ -1902,6 +1944,15 @@ async def export_latest(
 
 def _callback_message(callback: CallbackQuery) -> Message | None:
     return callback.message if isinstance(callback.message, Message) else None
+
+
+def _error_event_message(event: ErrorEvent) -> Message | None:
+    direct = getattr(event.update, "message", None)
+    if isinstance(direct, Message):
+        return direct
+    callback = getattr(event.update, "callback_query", None)
+    callback_message = getattr(callback, "message", None)
+    return callback_message if isinstance(callback_message, Message) else None
 
 
 def parse_discover_args(raw: str) -> tuple[str, int, DiscoveryOptions]:

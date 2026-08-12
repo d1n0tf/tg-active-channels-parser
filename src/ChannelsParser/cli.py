@@ -91,6 +91,9 @@ async def run(args: argparse.Namespace) -> None:
     settings = AppSettings.from_env(require_bot_token=False)
     storage = ChannelStorage(settings.database_path)
     storage.init()
+    recovered = storage.recover_interrupted_scans()
+    if recovered:
+        print(f"Помечено прерванных сканов после прошлого запуска: {recovered}")
 
     collector = TelegramChannelCollector(settings)
     await collector.connect()

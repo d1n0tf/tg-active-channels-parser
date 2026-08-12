@@ -85,6 +85,131 @@ def test_mark_flood_and_rotate_cools_account(tmp_path: Path, monkeypatch: pytest
     asyncio.run(run())
 
 
+def test_rotate_lease_to_healthy_after_transient_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, monkeypatch)
+    pool = AccountPool.from_settings(settings)
+    from ChannelsParser.accounts import _AccountSlot
+
+    a = _AccountSlot(account_id="a", session_path=tmp_path / "a.session", label="a")
+    b = _AccountSlot(account_id="b", session_path=tmp_path / "b.session", label="b")
+    a.client = object()  # type: ignore[assignment]
+    b.client = object()  # type: ignore[assignment]
+    pool._slots = [a, b]
+    pool._active_id = "a"
+
+    import asyncio
+
+    async def run() -> None:
+        lease = await pool.acquire()
+        token = pool.bind_lease(lease)
+        try:
+            assert await pool.rotate_lease_to_healthy(reason="RpcCallFailError") is True
+            assert lease.account_id == "b"
+            assert a.last_error == "RpcCallFailError"
+        finally:
+            pool.unbind_lease(token)
+            await pool.release(lease)
+
+    asyncio.run(run())
+
+
+def test_rotate_to_healthy_rebinds_current_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, monkeypatch)
+    pool = AccountPool.from_settings(settings)
+    from ChannelsParser.accounts import _AccountSlot
+
+    a = _AccountSlot(account_id="a", session_path=tmp_path / "a.session", label="a")
+    b = _AccountSlot(account_id="b", session_path=tmp_path / "b.session", label="b")
+    a.client = object()  # type: ignore[assignment]
+    b.client = object()  # type: ignore[assignment]
+    pool._slots = [a, b]
+    pool._active_id = "a"
+
+    import asyncio
+
+    async def run() -> None:
+        lease = await pool.acquire()
+        token = pool.bind_lease(lease)
+        try:
+            assert await pool.rotate_to_healthy(exclude_id="a") is True
+            assert lease.account_id == "b"
+            # The former healthy lease becomes available to another scan.
+            assert pool.free_account_count() == 1
+        finally:
+            pool.unbind_lease(token)
+            await pool.release(lease)
+
+    asyncio.run(run())
+
+
+def test_release_frees_original_and_replacement_after_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rotated scan must not leave its original account locked forever."""
+    settings = _settings(tmp_path, monkeypatch)
+    pool = AccountPool.from_settings(settings)
+    from ChannelsParser.accounts import _AccountSlot
+
+    a = _AccountSlot(account_id="a", session_path=tmp_path / "a.session", label="a")
+    b = _AccountSlot(account_id="b", session_path=tmp_path / "b.session", label="b")
+    a.client = object()  # type: ignore[assignment]
+    b.client = object()  # type: ignore[assignment]
+    pool._slots = [a, b]
+    pool._active_id = "a"
+
+    import asyncio
+
+    async def run() -> None:
+        lease = await pool.acquire()
+        token = pool.bind_lease(lease)
+        try:
+            assert await pool.rotate_to_healthy(exclude_id="a") is True
+            assert lease.account_id == "b"
+            assert pool._leased_ids == {"b"}
+        finally:
+            pool.unbind_lease(token)
+            await pool.release(lease)
+
+        assert pool._leased_ids == set()
+        assert pool.free_account_count() == 2
+
+    asyncio.run(run())
+
+
+def test_quarantine_without_spare_is_released_after_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, monkeypatch)
+    pool = AccountPool.from_settings(settings)
+    from ChannelsParser.accounts import _AccountSlot
+
+    a = _AccountSlot(account_id="a", session_path=tmp_path / "a.session", label="a")
+    a.client = object()  # type: ignore[assignment]
+    pool._slots = [a]
+    pool._active_id = "a"
+
+    import asyncio
+
+    async def run() -> None:
+        lease = await pool.acquire()
+        token = pool.bind_lease(lease)
+        try:
+            assert await pool.quarantine_active_and_rotate(reason="test") is False
+            assert pool._leased_ids == {"a"}
+        finally:
+            pool.unbind_lease(token)
+            await pool.release(lease)
+
+        assert pool._leased_ids == set()
+        assert a.cooldown_until is not None
+
+    asyncio.run(run())
+
+
 def test_prime_active_when_all_cooling(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Restart must not crash if all sessions still have FloodWait cooldowns in DB."""
     settings = _settings(tmp_path, monkeypatch)

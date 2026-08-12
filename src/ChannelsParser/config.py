@@ -27,6 +27,7 @@ class AppSettings:
     top_results: int
     flood_sleep_limit_seconds: int
     flood_switch_threshold_seconds: int
+    telegram_request_timeout_seconds: int
     discovery_comments_per_post: int
     discovery_profile_limit: int
     discovery_candidate_limit: int
@@ -74,6 +75,9 @@ class AppSettings:
             flood_switch_threshold_seconds=_positive_int(
                 "FLOOD_SWITCH_THRESHOLD_SECONDS",
                 _positive_int("FLOOD_SLEEP_LIMIT_SECONDS", 60),
+            ),
+            telegram_request_timeout_seconds=_positive_int(
+                "TELEGRAM_REQUEST_TIMEOUT_SECONDS", 45
             ),
             discovery_comments_per_post=_positive_int("DISCOVERY_COMMENTS_PER_POST", 150),
             discovery_profile_limit=_positive_int("DISCOVERY_PROFILE_LIMIT", 1500),
