@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import inspect
+import sqlite3
 from pathlib import Path
 
 from telethon import TelegramClient
@@ -80,6 +81,14 @@ async def list_accounts() -> None:
         )
 
 
+async def reset_pool() -> None:
+    """Forget all parser-account metadata without touching sessions or reports."""
+    settings = AppSettings.from_env(require_bot_token=False)
+    with sqlite3.connect(settings.database_path) as connection:
+        connection.execute("DROP TABLE IF EXISTS parser_accounts")
+    print("Реестр аккаунтов очищен. Файлы .session не затронуты.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Авторизация user-аккаунта Telethon для пула парсера"
@@ -95,12 +104,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Показать зарегистрированные аккаунты и выйти",
     )
+    parser.add_argument(
+        "--reset-pool",
+        action="store_true",
+        help="Забыть старый реестр аккаунтов, не удаляя .session и отчёты",
+    )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
     try:
+        if args.reset_pool:
+            asyncio.run(reset_pool())
+            return
         if args.list:
             asyncio.run(list_accounts())
             return

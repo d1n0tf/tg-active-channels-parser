@@ -35,9 +35,41 @@ def test_pool_discovers_named_sessions(tmp_path: Path, monkeypatch: pytest.Monke
 
     pool = AccountPool.from_settings(settings)
     ids = {info.account_id for info in pool.list_info()}
-    assert "default" in ids
+    assert "default" not in ids
     assert "work" in ids
     assert "spare" in ids
+
+
+def test_pool_does_not_register_missing_legacy_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, monkeypatch)
+    pool = AccountPool.from_settings(settings)
+
+    assert pool.list_info() == []
+    with pool._connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM parser_accounts").fetchone()[0] == 0
+
+
+def test_pool_removes_stale_database_accounts_after_session_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, monkeypatch)
+    sessions = settings.telegram_sessions_dir
+    sessions.mkdir()
+    old = sessions / "old.session"
+    old.write_bytes(b"old")
+    AccountPool.from_settings(settings)
+
+    old.unlink()
+    fresh = sessions / "fresh.session"
+    fresh.write_bytes(b"fresh")
+    pool = AccountPool.from_settings(settings)
+
+    assert [info.account_id for info in pool.list_info()] == ["fresh"]
+    with pool._connect() as connection:
+        ids = [row[0] for row in connection.execute("SELECT account_id FROM parser_accounts")]
+    assert ids == ["fresh"]
 
 
 def test_mark_flood_and_rotate_cools_account(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

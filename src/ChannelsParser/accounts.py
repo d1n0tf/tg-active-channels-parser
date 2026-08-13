@@ -178,7 +178,12 @@ class AccountPool:
         return conn
 
     def discover_sessions(self) -> None:
-        """Load sessions from sessions dir + legacy TELEGRAM_SESSION + DB rows."""
+        """Load exactly the session files that currently exist on disk.
+
+        ``parser_accounts`` is operational metadata, not a source of session
+        files.  In particular, an entry left there after a session rotation
+        must never make a removed ``.session`` reappear in the active pool.
+        """
         settings = self._settings
         sessions_dir = settings.telegram_sessions_dir
         sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -193,11 +198,15 @@ class AccountPool:
             if SLUG_RE.match(slug):
                 found[slug] = path.resolve()
 
-        # Legacy single session path (always register so existing installs keep working)
+        # Keep backward compatibility with a legacy single-session setup, but
+        # only when that file actually exists.  The old behavior registered the
+        # configured path unconditionally; TelegramClient then created a blank
+        # file for it during startup, which looked like a deleted old session
+        # had been restored.
         legacy = Path(settings.telegram_session)
         legacy_resolved = legacy.resolve() if legacy.is_absolute() else (Path.cwd() / legacy).resolve()
         legacy_slug = "default"
-        if legacy_slug not in found:
+        if legacy_resolved.is_file() and legacy_slug not in found:
             found[legacy_slug] = legacy_resolved
 
         # Merge DB state
@@ -243,50 +252,15 @@ class AccountPool:
                     consecutive_health_failures=health_failures,
                 )
 
-            # Sessions only in DB (path may still exist)
-            for account_id, row in rows.items():
-                if any(s.account_id == account_id for s in self._slots):
-                    continue
-                path = Path(row["session_path"])
-                self._slots.append(
-                    _AccountSlot(
-                        account_id=account_id,
-                        session_path=path,
-                        label=row["label"] or account_id,
-                        enabled=bool(row["enabled"]),
-                        cooldown_until=_parse_dt(row["cooldown_until"]),
-                        last_error=row["last_error"],
-                        total_flood_waits=int(row["total_flood_waits"] or 0),
-                        last_used_at=_parse_dt(row["last_used_at"]),
-                        last_checked_at=_parse_dt(row["last_checked_at"]),
-                        consecutive_health_failures=int(row["consecutive_health_failures"] or 0),
-                    )
+            # Delete stale metadata as well.  It is safe because an account is
+            # discoverable solely from a real current file, and prevents a
+            # removed account from being reported in the UI or recreated later.
+            stale_ids = set(rows) - set(found)
+            if stale_ids:
+                conn.executemany(
+                    "DELETE FROM parser_accounts WHERE account_id = ?",
+                    ((account_id,) for account_id in stale_ids),
                 )
-
-        if not self._slots:
-            # Ensure at least default slot for first login
-            path = Path(settings.telegram_session)
-            if not path.is_absolute():
-                path = (Path.cwd() / path).resolve()
-            self._slots.append(
-                _AccountSlot(
-                    account_id="default",
-                    session_path=path,
-                    label="default",
-                )
-            )
-            self._upsert_db(
-                account_id="default",
-                session_path=str(path),
-                label="default",
-                enabled=True,
-                cooldown_until=None,
-                last_error=None,
-                total_flood_waits=0,
-                last_used_at=None,
-                last_checked_at=None,
-                consecutive_health_failures=0,
-            )
 
         self._slots.sort(key=lambda s: s.account_id)
 
