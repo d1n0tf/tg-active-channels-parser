@@ -202,6 +202,42 @@ Score считается из:
 
 Панель `/filters` показывает текущие значения сразу на кнопках. Для магазинов одежды, агентств и студий можно поставить `Тип канала: коммерческие`. Чтобы не собирать фильтр заново, нажми `Сохранить как пресет`, отправь название одним сообщением и потом применяй набор через `/filterpresets`.
 
+### Session reliability
+
+The pool gives one scan an exclusive lease for one `.session`, and also holds a cross-process lock beside that file. Do not run a second bot instance, the login CLI, or another process against the same session file.
+
+- long `FloodWait` puts the account into cooldown and continues the job on a free session;
+- an unauthorized or revoked session is removed from the pool and the job switches to a spare when available;
+- idle sessions are checked on `ACCOUNT_HEALTH_CHECK_SECONDS`; the result appears in My accounts; and
+- completed scan reports are persisted before delivery; interrupted scans are marked on restart.
+
+Create an encrypted **local** backup after adding or changing each session:
+
+```bash
+# SESSION_BACKUP_KEY belongs in protected environment configuration, never git
+uv run tg-active-channels-backup create --name acc1
+uv run tg-active-channels-backup verify --name acc1
+uv run tg-active-channels-backup list
+```
+
+A backup protects against file loss, disk corruption and bad deployments. It does not restore a Telegram authorization that has been revoked server-side. Local restoration requires an explicit overwrite:
+
+```bash
+uv run tg-active-channels-backup restore --name acc1 --overwrite
+```
+
+#### Provisioning boundary
+
+A separate metadata-only registry is prepared for future owner-controlled onboarding. It stores only an account ID, a masked phone hint, and flags for 2FA/recovery email -- never a full number, OTP, password, email credential, or session string.
+
+```bash
+uv run tg-active-channels-provision draft --name acc3 --phone-hint '+7999***1234' --has-2fa --has-recovery-email
+uv run tg-active-channels-provision state --name acc3 --value awaiting_operator
+uv run tg-active-channels-provision list
+```
+
+Actual authorization remains manual through `tg-active-channels-login`; the boundary is isolated so a future legitimate interactive provisioning flow can be added without changing the UI or scan runtime.
+
 ### Ограничения
 
 - Ищутся только публичные каналы с username.

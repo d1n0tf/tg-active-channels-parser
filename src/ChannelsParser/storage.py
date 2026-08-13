@@ -32,12 +32,14 @@ class ChannelStorage:
                     filters TEXT NOT NULL,
                     total_candidates INTEGER NOT NULL DEFAULT 0,
                     total_reports INTEGER NOT NULL DEFAULT 0,
+                    progress TEXT,
                     error TEXT,
                     started_at TEXT NOT NULL,
                     finished_at TEXT
                 )
                 """
             )
+            _ensure_column(connection, "scans", "progress", "TEXT")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS user_filters (
@@ -405,13 +407,41 @@ class ChannelStorage:
                 (scan_id, user_id, mode, json.dumps(queries, ensure_ascii=False), _filters_json(filters), now),
             )
 
+    def update_scan_progress(
+        self,
+        scan_id: str,
+        *,
+        progress: dict[str, int],
+        total_candidates: int | None = None,
+        total_reports: int | None = None,
+    ) -> None:
+        """Persist a resumable diagnostic checkpoint for a running scan."""
+        payload = json.dumps(progress, ensure_ascii=False, sort_keys=True)
+        with self._connect() as connection:
+            if total_candidates is None and total_reports is None:
+                connection.execute(
+                    "UPDATE scans SET progress = ? WHERE scan_id = ? AND status = 'running'",
+                    (payload, scan_id),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE scans
+                    SET progress = ?,
+                        total_candidates = COALESCE(?, total_candidates),
+                        total_reports = COALESCE(?, total_reports)
+                    WHERE scan_id = ? AND status = 'running'
+                    """,
+                    (payload, total_candidates, total_reports, scan_id),
+                )
+
     def finish_scan(self, scan_id: str, *, total_candidates: int, total_reports: int) -> None:
         now = _dt(datetime.now(timezone.utc))
         with self._connect() as connection:
             connection.execute(
                 """
                 UPDATE scans
-                SET status = 'done', total_candidates = ?, total_reports = ?, finished_at = ?, error = NULL
+                SET status = 'done', total_candidates = ?, total_reports = ?, progress = NULL, finished_at = ?, error = NULL
                 WHERE scan_id = ?
                 """,
                 (total_candidates, total_reports, now, scan_id),
@@ -433,13 +463,25 @@ class ChannelStorage:
             )
         return cursor.rowcount
 
-    def fail_scan(self, scan_id: str, *, error: str, total_candidates: int = 0, total_reports: int = 0) -> None:
+    def fail_scan(
+        self,
+        scan_id: str,
+        *,
+        error: str,
+        total_candidates: int | None = None,
+        total_reports: int | None = None,
+    ) -> None:
+        """Fail a scan while retaining its last persisted progress checkpoint."""
         now = _dt(datetime.now(timezone.utc))
         with self._connect() as connection:
             connection.execute(
                 """
                 UPDATE scans
-                SET status = 'failed', total_candidates = ?, total_reports = ?, error = ?, finished_at = ?
+                SET status = 'failed',
+                    total_candidates = COALESCE(?, total_candidates),
+                    total_reports = COALESCE(?, total_reports),
+                    error = ?,
+                    finished_at = ?
                 WHERE scan_id = ?
                 """,
                 (total_candidates, total_reports, error[:1000], now, scan_id),

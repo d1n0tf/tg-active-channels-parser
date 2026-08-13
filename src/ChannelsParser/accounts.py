@@ -11,7 +11,16 @@ from pathlib import Path
 from typing import Any
 
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError
+from telethon.errors import (
+    AuthKeyError,
+    FloodWaitError,
+    SessionExpiredError,
+    SessionRevokedError,
+    UnauthorizedError,
+    UserDeactivatedBanError,
+    UserDeactivatedError,
+)
+from telethon.errors.common import AuthKeyNotFound
 
 from ChannelsParser.config import AppSettings
 from ChannelsParser.proxy import telethon_proxy
@@ -20,6 +29,19 @@ logger = logging.getLogger(__name__)
 
 SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_\-]{0,47}$")
 TRANSIENT_ACCOUNT_COOLDOWN_SECONDS = 2 * 60
+FATAL_SESSION_ERRORS = (
+    AuthKeyNotFound,
+    AuthKeyError,
+    SessionExpiredError,
+    SessionRevokedError,
+    UnauthorizedError,
+    UserDeactivatedError,
+    UserDeactivatedBanError,
+)
+
+
+class SessionUnauthorizedError(RuntimeError):
+    """Internal marker used when a lightweight health check finds no identity."""
 
 # Per-async-task lease so concurrent scans each keep their own Telethon client.
 _lease_var: ContextVar["AccountLease | None"] = ContextVar("parser_account_lease", default=None)
@@ -37,6 +59,8 @@ class AccountInfo:
     last_error: str | None
     total_flood_waits: int
     last_used_at: datetime | None
+    last_checked_at: datetime | None = None
+    consecutive_health_failures: int = 0
     is_active: bool = False
     is_connected: bool = False
     is_authorized: bool = False
@@ -71,6 +95,8 @@ class _AccountSlot:
     last_error: str | None = None
     total_flood_waits: int = 0
     last_used_at: datetime | None = None
+    last_checked_at: datetime | None = None
+    consecutive_health_failures: int = 0
     client: TelegramClient | None = field(default=None, repr=False)
 
 
@@ -108,6 +134,7 @@ class AccountPool:
         self._leased_ids: set[str] = set()
         self._lock = asyncio.Lock()
         self._db_path = settings.database_path
+        self._process_locks: dict[str, _SessionProcessLock] = {}
         self._ensure_table()
 
     # ------------------------------------------------------------------ setup
@@ -131,9 +158,18 @@ class AccountPool:
                     cooldown_until TEXT,
                     last_error TEXT,
                     total_flood_waits INTEGER NOT NULL DEFAULT 0,
-                    last_used_at TEXT
+                    last_used_at TEXT,
+                    last_checked_at TEXT,
+                    consecutive_health_failures INTEGER NOT NULL DEFAULT 0
                 )
                 """
+            )
+            _ensure_column(conn, "parser_accounts", "last_checked_at", "TEXT")
+            _ensure_column(
+                conn,
+                "parser_accounts",
+                "consecutive_health_failures",
+                "INTEGER NOT NULL DEFAULT 0",
             )
 
     def _connect(self) -> sqlite3.Connection:
@@ -178,6 +214,8 @@ class AccountPool:
                 last_error = row["last_error"] if row else None
                 floods = int(row["total_flood_waits"]) if row else 0
                 last_used = _parse_dt(row["last_used_at"]) if row else None
+                last_checked = _parse_dt(row["last_checked_at"]) if row else None
+                health_failures = int(row["consecutive_health_failures"] or 0) if row else 0
                 self._slots.append(
                     _AccountSlot(
                         account_id=account_id,
@@ -188,6 +226,8 @@ class AccountPool:
                         last_error=last_error,
                         total_flood_waits=floods,
                         last_used_at=last_used,
+                        last_checked_at=last_checked,
+                        consecutive_health_failures=health_failures,
                     )
                 )
                 self._upsert_db(
@@ -199,6 +239,8 @@ class AccountPool:
                     last_error=last_error,
                     total_flood_waits=floods,
                     last_used_at=last_used,
+                    last_checked_at=last_checked,
+                    consecutive_health_failures=health_failures,
                 )
 
             # Sessions only in DB (path may still exist)
@@ -216,6 +258,8 @@ class AccountPool:
                         last_error=row["last_error"],
                         total_flood_waits=int(row["total_flood_waits"] or 0),
                         last_used_at=_parse_dt(row["last_used_at"]),
+                        last_checked_at=_parse_dt(row["last_checked_at"]),
+                        consecutive_health_failures=int(row["consecutive_health_failures"] or 0),
                     )
                 )
 
@@ -240,6 +284,8 @@ class AccountPool:
                 last_error=None,
                 total_flood_waits=0,
                 last_used_at=None,
+                last_checked_at=None,
+                consecutive_health_failures=0,
             )
 
         self._slots.sort(key=lambda s: s.account_id)
@@ -252,6 +298,8 @@ class AccountPool:
             slot.enabled = True
             slot.cooldown_until = None
             slot.last_error = None
+            slot.consecutive_health_failures = 0
+            slot.last_checked_at = datetime.now(timezone.utc)
             self._persist_slot(slot)
             return True
         return False
@@ -267,14 +315,17 @@ class AccountPool:
         last_error: str | None,
         total_flood_waits: int,
         last_used_at: datetime | None,
+        last_checked_at: datetime | None,
+        consecutive_health_failures: int,
     ) -> None:
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO parser_accounts(
                     account_id, session_path, label, enabled, cooldown_until,
-                    last_error, total_flood_waits, last_used_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    last_error, total_flood_waits, last_used_at, last_checked_at,
+                    consecutive_health_failures
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id) DO UPDATE SET
                     session_path = excluded.session_path,
                     label = excluded.label,
@@ -282,7 +333,9 @@ class AccountPool:
                     cooldown_until = excluded.cooldown_until,
                     last_error = excluded.last_error,
                     total_flood_waits = excluded.total_flood_waits,
-                    last_used_at = excluded.last_used_at
+                    last_used_at = excluded.last_used_at,
+                    last_checked_at = excluded.last_checked_at,
+                    consecutive_health_failures = excluded.consecutive_health_failures
                 """,
                 (
                     account_id,
@@ -293,6 +346,8 @@ class AccountPool:
                     last_error,
                     total_flood_waits,
                     _iso(last_used_at),
+                    _iso(last_checked_at),
+                    consecutive_health_failures,
                 ),
             )
 
@@ -306,9 +361,23 @@ class AccountPool:
             last_error=slot.last_error,
             total_flood_waits=slot.total_flood_waits,
             last_used_at=slot.last_used_at,
+            last_checked_at=slot.last_checked_at,
+            consecutive_health_failures=slot.consecutive_health_failures,
         )
 
     # ------------------------------------------------------------------ lifecycle
+
+    def _acquire_process_lock(self, slot: _AccountSlot) -> None:
+        lock = self._process_locks.get(slot.account_id)
+        if lock is None:
+            lock = _SessionProcessLock(slot.session_path)
+            self._process_locks[slot.account_id] = lock
+        lock.acquire()
+
+    def _release_process_lock(self, account_id: str) -> None:
+        lock = self._process_locks.pop(account_id, None)
+        if lock is not None:
+            lock.release()
 
     def _make_client(self, slot: _AccountSlot) -> TelegramClient:
         session = str(slot.session_path)
@@ -331,6 +400,7 @@ class AccountPool:
                 continue
             client = self._make_client(slot)
             try:
+                self._acquire_process_lock(slot)
                 await client.connect()
                 if await client.is_user_authorized():
                     me = await client.get_me()
@@ -355,9 +425,24 @@ class AccountPool:
                         logger.info("Account ready: %s (%s)", slot.account_id, slot.label)
                 else:
                     await _disconnect(client)
-                    slot.last_error = "not authorized"
+                    self._release_process_lock(slot.account_id)
+                    slot.enabled = False
+                    slot.last_checked_at = datetime.now(timezone.utc)
+                    slot.last_error = "not authorized: session must be re-authorized"
                     self._persist_slot(slot)
                     logger.warning("Account %s session not authorized", slot.account_id)
+            except FATAL_SESSION_ERRORS as exc:
+                slot.enabled = False
+                slot.cooldown_until = None
+                slot.last_checked_at = datetime.now(timezone.utc)
+                slot.last_error = f"{type(exc).__name__}: session must be re-authorized"
+                self._persist_slot(slot)
+                logger.error("Account %s session is unusable: %s", slot.account_id, exc)
+                try:
+                    await _disconnect(client)
+                except Exception:
+                    pass
+                self._release_process_lock(slot.account_id)
             except Exception as exc:
                 slot.last_error = f"{type(exc).__name__}: {exc}"
                 self._persist_slot(slot)
@@ -366,6 +451,7 @@ class AccountPool:
                     await _disconnect(client)
                 except Exception:
                     pass
+                self._release_process_lock(slot.account_id)
 
         if authorized == 0:
             raise RuntimeError(
@@ -428,6 +514,7 @@ class AccountPool:
                 except Exception:
                     logger.debug("disconnect %s failed", slot.account_id, exc_info=True)
                 slot.client = None
+            self._release_process_lock(slot.account_id)
         self._leased_ids.clear()
 
     # ------------------------------------------------------------------ leases
@@ -472,6 +559,8 @@ class AccountPool:
                     last_error=slot.last_error,
                     total_flood_waits=slot.total_flood_waits,
                     last_used_at=slot.last_used_at,
+                    last_checked_at=slot.last_checked_at,
+                    consecutive_health_failures=slot.consecutive_health_failures,
                     is_active=leased or slot.account_id == self._active_id,
                     is_connected=slot.client is not None and bool(
                         getattr(slot.client, "is_connected", lambda: False)()
@@ -708,6 +797,7 @@ class AccountPool:
                     await _disconnect(slot.client)
             finally:
                 slot.client = None
+                self._release_process_lock(slot.account_id)
 
             candidates = [
                 candidate
@@ -763,6 +853,80 @@ class AccountPool:
         """Backward-compatible alias for transient-error quarantine."""
         return await self.quarantine_active_and_rotate(reason=reason)
 
+    async def check_health(self) -> list[AccountInfo]:
+        """Check idle sessions without competing with an active scan lease."""
+        raw_threshold = getattr(self._settings, "account_health_failure_threshold", 2)
+        try:
+            threshold = max(1, int(raw_threshold))
+        except (TypeError, ValueError):
+            threshold = 2
+        async with self._lock:
+            slots = [
+                slot for slot in self._slots
+                if slot.enabled and slot.client is not None and slot.account_id not in self._leased_ids
+            ]
+            for slot in slots:
+                try:
+                    await self._check_slot_health(slot)
+                except (*FATAL_SESSION_ERRORS, SessionUnauthorizedError) as exc:
+                    slot.enabled = False
+                    slot.cooldown_until = None
+                    slot.last_error = (
+                        f"health check: {type(exc).__name__}: session must be re-authorized"
+                    )
+                    slot.consecutive_health_failures += 1
+                    slot.last_checked_at = datetime.now(timezone.utc)
+                    self._persist_slot(slot)
+                    try:
+                        await _disconnect(slot.client)
+                    finally:
+                        slot.client = None
+                        self._release_process_lock(slot.account_id)
+                    if self._active_id == slot.account_id:
+                        self._active_id = None
+                    logger.error("Health check disabled unusable session %s", slot.account_id)
+                except Exception as exc:
+                    slot.consecutive_health_failures += 1
+                    slot.last_checked_at = datetime.now(timezone.utc)
+                    slot.last_error = (
+                        f"health check {slot.consecutive_health_failures}/{threshold}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    if slot.consecutive_health_failures >= threshold:
+                        slot.cooldown_until = datetime.now(timezone.utc) + timedelta(
+                            seconds=TRANSIENT_ACCOUNT_COOLDOWN_SECONDS
+                        )
+                    self._persist_slot(slot)
+                    logger.warning("Health check failed for %s", slot.account_id, exc_info=True)
+                else:
+                    slot.last_checked_at = datetime.now(timezone.utc)
+                    slot.consecutive_health_failures = 0
+                    if slot.last_error and slot.last_error.startswith("health check"):
+                        slot.last_error = None
+                    self._persist_slot(slot)
+
+            if self._active_id is None:
+                healthy = self._free_healthy_slots()
+                if healthy:
+                    healthy.sort(
+                        key=lambda item: item.last_used_at
+                        or datetime.fromtimestamp(0, tz=timezone.utc)
+                    )
+                    self._active_id = healthy[0].account_id
+        return self.list_info()
+
+    async def _check_slot_health(self, slot: _AccountSlot) -> None:
+        client = slot.client
+        if client is None:
+            raise RuntimeError("client is not connected")
+        if not client.is_connected():
+            await client.connect()
+        if not await client.is_user_authorized():
+            raise SessionUnauthorizedError("session is not authorized")
+        me = await client.get_me()
+        if me is None:
+            raise SessionUnauthorizedError("session is not authorized")
+
     def seconds_until_any_available(self) -> int | None:
         """Min seconds until some free healthy account exists. None if free now."""
         if self._free_healthy_slots():
@@ -782,6 +946,78 @@ class AccountPool:
                 return 30
             return None
         return max(1, int(min(waits)))
+
+
+class _SessionProcessLock:
+    """Advisory cross-process lock stored beside a Telethon session file."""
+
+    def __init__(self, session_path: Path) -> None:
+        self._path = Path(f"{session_path}.lock")
+        self._handle: Any | None = None
+
+    def acquire(self) -> None:
+        if self._handle is not None:
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self._path.open("a+b")
+        try:
+            _lock_file(handle)
+        except Exception as exc:
+            handle.close()
+            raise RuntimeError(
+                f"Session is already in use by another process: {self._path.with_suffix('')}"
+            ) from exc
+        self._handle = handle
+
+    def release(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is None:
+            return
+        try:
+            _unlock_file(handle)
+        finally:
+            handle.close()
+
+
+def _lock_file(handle: Any) -> None:
+    import os
+
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0, 2)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_file(handle: Any) -> None:
+    import os
+
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        return
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _ensure_column(connection: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
+    columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
 
 def session_path_for(settings: AppSettings, account_id: str) -> Path:

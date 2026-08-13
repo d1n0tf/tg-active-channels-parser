@@ -7,7 +7,12 @@ from pathlib import Path
 
 from telethon import TelegramClient
 
-from ChannelsParser.accounts import AccountPool, session_path_for, validate_account_id
+from ChannelsParser.accounts import (
+    AccountPool,
+    _SessionProcessLock,
+    session_path_for,
+    validate_account_id,
+)
 from ChannelsParser.config import AppSettings, ConfigError
 from ChannelsParser.proxy import telethon_proxy
 
@@ -25,26 +30,31 @@ async def login(*, account_id: str, phone: str | None) -> None:
     if session.endswith(".session"):
         session = session[: -len(".session")]
 
+    lock = _SessionProcessLock(path)
+    lock.acquire()
     client = TelegramClient(
         session,
         settings.telegram_api_id,
         settings.telegram_api_hash,
         proxy=telethon_proxy(settings.telegram_proxy_url),
     )
-    start_result: object = client.start(phone=phone)
-    if inspect.isawaitable(start_result):
-        await start_result
-    me = await client.get_me()
-    username = (
-        getattr(me, "username", None)
-        or getattr(me, "phone", None)
-        or getattr(me, "id", "unknown")
-    )
-    print(f"OK: аккаунт '{account_id}' готов → {username}")
-    print(f"    session: {path}")
-    disconnect_result: object = client.disconnect()
-    if inspect.isawaitable(disconnect_result):
-        await disconnect_result
+    try:
+        start_result: object = client.start(phone=phone)
+        if inspect.isawaitable(start_result):
+            await start_result
+        me = await client.get_me()
+        username = (
+            getattr(me, "username", None)
+            or getattr(me, "phone", None)
+            or getattr(me, "id", "unknown")
+        )
+        print(f"OK: account '{account_id}' ready -> {username}")
+        print(f"    session: {path}")
+    finally:
+        disconnect_result: object = client.disconnect()
+        if inspect.isawaitable(disconnect_result):
+            await disconnect_result
+        lock.release()
 
     # Refresh pool registry so DB knows about the new session
     pool = AccountPool.from_settings(settings)

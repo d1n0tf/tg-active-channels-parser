@@ -20,7 +20,11 @@ class AppSettings:
     telegram_api_hash: str
     telegram_session: str
     telegram_sessions_dir: Path
+    telegram_backups_dir: Path
     telegram_phone: str | None
+    session_backup_key: str | None
+    account_health_check_seconds: int
+    account_health_failure_threshold: int
     database_path: Path
     search_limit_per_query: int
     history_limit: int
@@ -65,7 +69,14 @@ class AppSettings:
             telegram_sessions_dir=Path(
                 _optional("TELEGRAM_SESSIONS_DIR", "data/sessions") or "data/sessions"
             ),
+            telegram_backups_dir=Path(
+                _optional("TELEGRAM_BACKUPS_DIR", "data/session-backups")
+                or "data/session-backups"
+            ),
             telegram_phone=_optional("TELEGRAM_PHONE"),
+            session_backup_key=_optional("SESSION_BACKUP_KEY"),
+            account_health_check_seconds=_positive_int("ACCOUNT_HEALTH_CHECK_SECONDS", 15 * 60),
+            account_health_failure_threshold=_positive_int("ACCOUNT_HEALTH_FAILURE_THRESHOLD", 2),
             database_path=Path(_optional("DATABASE_PATH", "data/channels.sqlite3") or "data/channels.sqlite3"),
             search_limit_per_query=_positive_int("SEARCH_LIMIT_PER_QUERY", 40),
             history_limit=_positive_int("HISTORY_LIMIT", 40),

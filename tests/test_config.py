@@ -93,3 +93,22 @@ def _set_required_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DISCOVERY_GIFT_LIMIT", raising=False)
     monkeypatch.delenv("TELEGRAM_REQUEST_TIMEOUT_SECONDS", raising=False)
     monkeypatch.delenv("ADMIN_USER_IDS", raising=False)
+    monkeypatch.delenv("TELEGRAM_BACKUPS_DIR", raising=False)
+    monkeypatch.delenv("ACCOUNT_HEALTH_CHECK_SECONDS", raising=False)
+    monkeypatch.delenv("ACCOUNT_HEALTH_FAILURE_THRESHOLD", raising=False)
+    monkeypatch.delenv("SESSION_BACKUP_KEY", raising=False)
+
+
+def test_settings_support_session_reliability_controls(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("TELEGRAM_BACKUPS_DIR", "data/encrypted-backups")
+    monkeypatch.setenv("ACCOUNT_HEALTH_CHECK_SECONDS", "120")
+    monkeypatch.setenv("ACCOUNT_HEALTH_FAILURE_THRESHOLD", "3")
+    monkeypatch.setenv("SESSION_BACKUP_KEY", "secret")
+
+    settings = AppSettings.from_env(require_bot_token=True)
+
+    assert settings.telegram_backups_dir.name == "encrypted-backups"
+    assert settings.account_health_check_seconds == 120
+    assert settings.account_health_failure_threshold == 3
+    assert settings.session_backup_key == "secret"

@@ -128,8 +128,23 @@ async def run_search(args: argparse.Namespace, collector: TelegramChannelCollect
     scan_id = uuid.uuid4().hex
     storage.create_scan(scan_id, user_id=None, mode="search", queries=queries, filters=filters)
 
+    last_checkpoint = 0.0
+
+    async def checkpoint(stats: dict[str, int]) -> None:
+        nonlocal last_checkpoint
+        now = asyncio.get_running_loop().time()
+        if now - last_checkpoint < 2.0:
+            return
+        last_checkpoint = now
+        storage.update_scan_progress(
+            scan_id,
+            progress=stats,
+            total_candidates=int(stats.get("candidates_found", 0) or 0),
+            total_reports=int(stats.get("reports_found", 0) or 0),
+        )
+
     try:
-        result = await collector.search_channels(queries, filters)
+        result = await collector.search_channels(queries, filters, progress_callback=checkpoint)
         storage.save_reports(scan_id, result.reports)
         storage.finish_scan(scan_id, total_candidates=result.total_candidates, total_reports=len(result.reports))
     except Exception as exc:
@@ -163,6 +178,21 @@ async def run_discover(args: argparse.Namespace, collector: TelegramChannelColle
     queries = [args.channel, f"posts:{args.posts}"]
     storage.create_scan(scan_id, user_id=None, mode="discover", queries=queries, filters=filters)
 
+    last_checkpoint = 0.0
+
+    async def checkpoint(stats: dict[str, int]) -> None:
+        nonlocal last_checkpoint
+        now = asyncio.get_running_loop().time()
+        if now - last_checkpoint < 2.0:
+            return
+        last_checkpoint = now
+        storage.update_scan_progress(
+            scan_id,
+            progress=stats,
+            total_candidates=int(stats.get("candidates_total", 0) or 0),
+            total_reports=int(stats.get("reports_found", 0) or 0),
+        )
+
     try:
         result = await collector.discover_channels_from_comments(
             args.channel,
@@ -172,6 +202,7 @@ async def run_discover(args: argparse.Namespace, collector: TelegramChannelColle
             profile_limit=args.profile_limit,
             candidate_limit=args.candidate_limit,
             gift_limit=args.gift_limit,
+            progress_callback=checkpoint,
         )
         storage.save_reports(scan_id, result.reports)
         storage.finish_scan(scan_id, total_candidates=result.total_candidates, total_reports=len(result.reports))

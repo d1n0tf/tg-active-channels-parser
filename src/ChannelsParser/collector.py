@@ -80,18 +80,33 @@ class TelegramChannelCollector:
         await self._pool.close()
 
     async def search_channels(
-        self, queries: list[str], filters: SearchFilters, *, should_stop=None
+        self,
+        queries: list[str],
+        filters: SearchFilters,
+        *,
+        should_stop=None,
+        progress_callback=None,
     ) -> SearchRunResult:
         lease = await self._pool.acquire()
         token = self._pool.bind_lease(lease)
         try:
-            return await self._search_channels_body(queries, filters, should_stop=should_stop)
+            return await self._search_channels_body(
+                queries,
+                filters,
+                should_stop=should_stop,
+                progress_callback=progress_callback,
+            )
         finally:
             self._pool.unbind_lease(token)
             await self._pool.release(lease)
 
     async def _search_channels_body(
-        self, queries: list[str], filters: SearchFilters, *, should_stop=None
+        self,
+        queries: list[str],
+        filters: SearchFilters,
+        *,
+        should_stop=None,
+        progress_callback=None,
     ) -> SearchRunResult:
         now = datetime.now(timezone.utc)
         reports_by_id: dict[int, ChannelReport] = {}
@@ -99,10 +114,22 @@ class TelegramChannelCollector:
         inspected_channels = 0
         skipped_channels = 0
         errors: list[str] = []
+        clean_queries = _clean_queries(queries)
+        stats = {
+            "phase": 1,
+            "queries_total": len(clean_queries),
+            "queries_done": 0,
+            "candidates_found": 0,
+            "candidates_done": 0,
+            "reports_found": 0,
+            "skipped_channels": 0,
+        }
+        await _notify_progress(progress_callback, stats)
 
-        for query in _clean_queries(queries):
+        for query in clean_queries:
             if _should_stop(should_stop):
                 errors.append("Остановлено пользователем")
+                await _notify_progress(progress_callback, stats)
                 break
             try:
                 found = await self._with_short_flood_retry(lambda: self._search_public_chats(query))
@@ -114,18 +141,27 @@ class TelegramChannelCollector:
                 continue
             except RPCError as exc:
                 errors.append(f"{query}: {type(exc).__name__}")
+                stats["queries_done"] += 1
+                await _notify_progress(progress_callback, stats)
                 continue
             except Exception as exc:
                 errors.append(f"{query}: {type(exc).__name__}: {exc}")
+                stats["queries_done"] += 1
+                await _notify_progress(progress_callback, stats)
                 continue
 
             total_candidates += len(found)
+            stats["candidates_found"] = total_candidates
+            await _notify_progress(progress_callback, stats)
             for chat in found:
                 if _should_stop(should_stop):
                     errors.append("Остановлено пользователем")
                     break
                 if not _is_public_broadcast_channel(chat):
                     skipped_channels += 1
+                    stats["candidates_done"] += 1
+                    stats["skipped_channels"] = skipped_channels
+                    await _notify_progress(progress_callback, stats)
                     continue
 
                 try:
@@ -138,26 +174,45 @@ class TelegramChannelCollector:
                         f"{getattr(chat, 'username', chat.id)}: FloodWait {exc.seconds}s, нет свободных аккаунтов"
                     )
                     skipped_channels += 1
+                    stats["candidates_done"] += 1
+                    stats["skipped_channels"] = skipped_channels
+                    await _notify_progress(progress_callback, stats)
                     continue
                 except RPCError as exc:
                     errors.append(
                         f"{getattr(chat, 'username', chat.id)}: {type(exc).__name__}"
                     )
                     skipped_channels += 1
+                    stats["candidates_done"] += 1
+                    stats["skipped_channels"] = skipped_channels
+                    await _notify_progress(progress_callback, stats)
                     continue
                 except Exception as exc:
                     errors.append(
                         f"{getattr(chat, 'username', chat.id)}: {type(exc).__name__}: {exc}"
                     )
                     skipped_channels += 1
+                    stats["candidates_done"] += 1
+                    stats["skipped_channels"] = skipped_channels
+                    await _notify_progress(progress_callback, stats)
                     continue
 
+                stats["candidates_done"] += 1
+                stats["skipped_channels"] = skipped_channels
                 existing = reports_by_id.get(report.telegram_id)
                 if existing:
                     if query not in existing.matched_queries:
                         existing.matched_queries.append(query)
+                    stats["reports_found"] = len(reports_by_id)
+                    await _notify_progress(progress_callback, stats)
                     continue
                 reports_by_id[report.telegram_id] = report
+                stats["reports_found"] = len(reports_by_id)
+                await _notify_progress(progress_callback, stats)
+
+            stats["queries_done"] += 1
+            stats["skipped_channels"] = skipped_channels
+            await _notify_progress(progress_callback, stats)
 
         filtered = [
             report
@@ -170,6 +225,7 @@ class TelegramChannelCollector:
             inspected_channels=inspected_channels,
             skipped_channels=skipped_channels,
             errors=errors,
+            stats=stats,
         )
 
     async def discover_channels_from_comments(

@@ -23,6 +23,8 @@ tg-active-channels = "ChannelsParser.cli:main"
 tg-active-channels-bot = "ChannelsParser.bot:main"
 tg-active-channels-login = "ChannelsParser.login:main"
 tg-active-channels-tdata = "ChannelsParser.convert_tdata:main"
+tg-active-channels-backup = "ChannelsParser.session_backup:main"
+tg-active-channels-provision = "ChannelsParser.provisioning:main"
 
 [build-system]
 requires = ["hatchling"]

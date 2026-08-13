@@ -279,6 +279,7 @@ async def run_bot() -> None:
 
     bot: Bot | None = None
     renewal_task: asyncio.Task[None] | None = None
+    health_task: asyncio.Task[None] | None = None
     try:
         bot = Bot(
             settings.bot_token or "",
@@ -291,8 +292,18 @@ async def run_bot() -> None:
             renewal_reminder_loop(bot, storage),
             name="renewal-reminder-loop",
         )
+        health_task = asyncio.create_task(
+            account_health_loop(collector, settings),
+            name="parser-account-health-loop",
+        )
         await dispatcher.start_polling(bot)
     finally:
+        if health_task is not None:
+            health_task.cancel()
+            try:
+                await health_task
+            except asyncio.CancelledError:
+                pass
         if renewal_task is not None:
             renewal_task.cancel()
             try:
@@ -328,6 +339,31 @@ async def renewal_reminder_loop(bot: Bot, storage: ChannelStorage) -> None:
         except Exception:
             logging.exception("Renewal reminder loop error")
         await asyncio.sleep(RENEWAL_CHECK_INTERVAL_SECONDS)
+
+
+async def account_health_loop(
+    collector: TelegramChannelCollector, settings: AppSettings
+) -> None:
+    """Periodically validate idle parser sessions without disturbing active scans."""
+    interval = max(60, int(settings.account_health_check_seconds))
+    while True:
+        try:
+            infos = await collector.pool.check_health()
+            healthy = sum(
+                1
+                for info in infos
+                if info.enabled and info.is_authorized and not info.is_cooling
+            )
+            logging.debug(
+                "Parser account health check complete: healthy=%s total=%s",
+                healthy,
+                len(infos),
+            )
+            if healthy == 0:
+                logging.error("No healthy parser accounts are currently available")
+        except Exception:
+            logging.exception("Parser account health loop error")
+        await asyncio.sleep(interval)
 
 
 async def bot_send_branded(bot: Bot, chat_id: int, text: str) -> None:
@@ -1584,6 +1620,49 @@ async def run_scan(
             reply_markup=scan_cancel_keyboard(),
         )
 
+        progress_message = message
+        started_at = datetime.now(timezone.utc)
+        last_progress_update = 0.0
+
+        async def update_progress(stats: dict[str, int]) -> None:
+            nonlocal last_progress_update, progress_message
+            now_mono = time.monotonic()
+            if now_mono - last_progress_update < 2.0:
+                return
+            last_progress_update = now_mono
+            storage.update_scan_progress(
+                scan_id,
+                progress=stats,
+                total_candidates=int(stats.get("candidates_found", 0) or 0),
+                total_reports=int(stats.get("reports_found", 0) or 0),
+            )
+            try:
+                processed = int(stats.get("queries_done", 0) or 0)
+                total = max(1, int(stats.get("queries_total", len(queries)) or len(queries)))
+                found = int(stats.get("reports_found", 0) or 0)
+                edited = await edit_branded(
+                    progress_message,
+                    format_scan_progress_card(
+                        title="🔎 Поиск каналов",
+                        progress_label="запросы",
+                        processed=processed,
+                        total=total,
+                        found=found,
+                        started_at=started_at,
+                        details=(
+                            f"{label}{query_preview}\n\n"
+                            f"Candidates: {stats.get('candidates_found', 0)} / "
+                            f"checked: {stats.get('candidates_done', 0)}\n"
+                            f"{format_filters(filters)}"
+                        ),
+                    ),
+                    reply_markup=scan_cancel_keyboard(),
+                )
+                if isinstance(edited, Message):
+                    progress_message = edited
+            except Exception:
+                logging.debug("Could not edit search progress message", exc_info=True)
+
         try:
             # For keyword search there is no separate "inspect candidates" phase:
             # soft finish and hard cancel both stop remaining queries.
@@ -1594,6 +1673,7 @@ async def run_scan(
                     state.scan_cancelled(user_id)
                     or state.scan_finish_collection_requested(user_id)
                 ),
+                progress_callback=update_progress,
             )
             reports = result.reports
             storage.save_reports(scan_id, reports)
@@ -1681,6 +1761,12 @@ async def run_discovery(
             if now - last_progress_update < 2.0:
                 return
             last_progress_update = now
+            storage.update_scan_progress(
+                scan_id,
+                progress=stats,
+                total_candidates=int(stats.get("candidates_total", 0) or 0),
+                total_reports=int(stats.get("reports_found", 0) or 0),
+            )
             try:
                 edited = await edit_branded(
                     progress_message,
@@ -2455,11 +2541,17 @@ def format_accounts_menu(pool: object) -> str:
         cool = ""
         if info.is_cooling and info.cooldown_until:
             cool = f"\n    cooldown до {info.cooldown_until.strftime('%d.%m %H:%M')} UTC"
-        err = f"\n    ⚠ {info.last_error}" if info.last_error and not info.is_cooling else ""
+        err = f"\n    ! {info.last_error}" if info.last_error and not info.is_cooling else ""
+        checked = "never"
+        if info.last_checked_at is not None:
+            checked = info.last_checked_at.strftime("%d.%m %H:%M UTC")
+        health = f"\n    health: {checked}"
+        if info.consecutive_health_failures:
+            health += f"; consecutive failures: {info.consecutive_health_failures}"
         lines.append(
-            f"{mark} {info.account_id} · {info.label}\n"
-            f"    статус: {info.status_label} · floods: {info.total_flood_waits}"
-            f"{cool}{err}"
+            f"{mark} {info.account_id} - {info.label}\n"
+            f"    status: {info.status_label} - floods: {info.total_flood_waits}"
+            f"{health}{cool}{err}"
         )
     lines.extend(
         [

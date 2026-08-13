@@ -16,3 +16,5 @@ data/*
 exports/
 *.session
 *.session-journal
+*.session.lock
+*.tgbackup
