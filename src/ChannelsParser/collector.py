@@ -330,6 +330,14 @@ class TelegramChannelCollector:
             ) from exc
         except (UsernameInvalidError, UsernameNotOccupiedError, ChannelInvalidError) as exc:
             raise ValueError(f"Не смог найти донорский канал: {source_identifier}") from exc
+        except ValueError as exc:
+            # Telethon converts UsernameNotOccupiedError raised by
+            # ResolveUsernameRequest into this ValueError inside get_entity().
+            if _is_missing_username_error(exc):
+                raise ValueError(
+                    f"Не смог найти донорский канал: {source_identifier}"
+                ) from exc
+            raise
         if not isinstance(source, types.Channel) or not _is_public_broadcast_channel(source):
             raise ValueError("Донор должен быть публичным broadcast-каналом Telegram")
 
@@ -851,6 +859,11 @@ class TelegramChannelCollector:
             ChannelInvalidError,
         ) as exc:
             raise ValueError(f"Не смог найти канал: {identifier}") from exc
+        except ValueError as exc:
+            # See the analogous source-channel handling in Discovery above.
+            if _is_missing_username_error(exc):
+                raise ValueError(f"Не смог найти канал: {identifier}") from exc
+            raise
         if not isinstance(entity, types.Channel) or not _is_public_broadcast_channel(
             entity
         ):
@@ -1000,6 +1013,12 @@ def normalize_channel_identifier(identifier: str) -> str:
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", value):
         raise ValueError("Некорректный username канала")
     return value
+
+
+def _is_missing_username_error(exc: ValueError) -> bool:
+    """Recognize Telethon's wrapper for an unoccupied public username."""
+    text = str(exc)
+    return text.startswith('No user has "') and text.endswith('" as username')
 
 
 def extract_channel_references(text: str | None) -> list[str]:

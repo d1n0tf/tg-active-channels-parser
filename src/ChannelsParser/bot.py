@@ -1811,6 +1811,16 @@ async def run_discovery(
                 total_candidates=result.total_candidates,
                 total_reports=len(reports),
             )
+        except ValueError as exc:
+            # A missing or malformed public username is a normal user-input
+            # outcome, not an application failure worth an ERROR traceback.
+            logging.info("Discovery input rejected scan_id=%s: %s", scan_id, exc)
+            storage.fail_scan(scan_id, error=str(exc))
+            await send_branded(
+                message,
+                f"❌ Discovery не запущен\n{operation_error_text(exc)}",
+            )
+            return
         except Exception as exc:
             logging.exception("Discovery scan failed scan_id=%s", scan_id)
             storage.fail_scan(scan_id, error=str(exc))

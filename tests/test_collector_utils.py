@@ -51,6 +51,40 @@ def test_normalize_channel_identifier_rejects_invalid_username() -> None:
         normalize_channel_identifier("https://t.me/not-a-channel")
 
 
+def test_discovery_reports_an_unoccupied_source_username_as_input_error() -> None:
+    class Client:
+        async def get_entity(self, username: str):
+            raise ValueError(f'No user has "{username}" as username')
+
+    class MissingSourceCollector(TelegramChannelCollector):
+        def __init__(self) -> None:
+            self._settings = SimpleNamespace()
+            self._pool = _FakePool()  # type: ignore[assignment]
+            self._test_client = Client()
+
+        @property
+        def _client(self):
+            return self._test_client
+
+        async def _with_short_flood_retry(self, func, *args, **kwargs):
+            return await func(*args, **kwargs)
+
+    async def scenario() -> None:
+        collector = MissingSourceCollector()
+        with pytest.raises(ValueError, match="Не смог найти донорский канал: @lovkkenn"):
+            await collector.discover_channels_from_comments(
+                "@lovkkenn",
+                SearchFilters(),
+                post_limit=10,
+                comments_per_post=10,
+                profile_limit=0,
+                candidate_limit=10,
+                gift_limit=0,
+            )
+
+    asyncio.run(scenario())
+
+
 def test_message_counters_tolerate_unexpected_values() -> None:
     message = SimpleNamespace(
         views="not-a-number",

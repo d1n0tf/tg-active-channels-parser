@@ -263,6 +263,40 @@ def test_run_discovery_uses_broad_active_filters() -> None:
     asyncio.run(scenario())
 
 
+def test_run_discovery_handles_missing_source_as_input_error() -> None:
+    class MissingSourceCollector:
+        async def discover_channels_from_comments(self, identifier, filters, **kwargs) -> SearchRunResult:
+            raise ValueError("Не смог найти донорский канал: @lovkkenn")
+
+    async def scenario() -> None:
+        storage = FakeStorage()
+        state = BotState(storage)  # type: ignore
+        settings = SimpleNamespace(
+            top_results=10,
+            discovery_comments_per_post=100,
+            discovery_profile_limit=500,
+            discovery_candidate_limit=300,
+            discovery_gift_limit=10,
+        )
+        message = FakeMessage()
+
+        await run_discovery(
+            message,
+            "@lovkkenn",
+            100,
+            state,
+            MissingSourceCollector(),  # type: ignore[arg-type]
+            storage,
+            settings,
+            user_id=42,
+        )
+
+        assert any("Не смог найти донорский канал: @lovkkenn" in answer for answer in message.answers)
+        assert not state.is_scan_running(42)
+
+    asyncio.run(scenario())
+
+
 class FakeMessage:
     def __init__(self) -> None:
         self.answers: list[str] = []
