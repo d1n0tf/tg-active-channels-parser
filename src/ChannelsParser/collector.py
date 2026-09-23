@@ -318,9 +318,7 @@ class TelegramChannelCollector:
 
         source_username = normalize_channel_identifier(source_identifier)
         try:
-            source = await self._with_short_flood_retry(
-                lambda: self._client.get_entity(source_username)
-            )
+            source = await self._resolve_public_username(source_username)
         except FloodWaitError as exc:
             wait_h = max(1, exc.seconds // 3600)
             raise RuntimeError(
@@ -850,9 +848,7 @@ class TelegramChannelCollector:
     ) -> ChannelReport:
         username = normalize_channel_identifier(identifier)
         try:
-            entity = await self._with_short_flood_retry(
-                lambda: self._client.get_entity(username)
-            )
+            entity = await self._resolve_public_username(username)
         except (
             UsernameInvalidError,
             UsernameNotOccupiedError,
@@ -871,6 +867,43 @@ class TelegramChannelCollector:
         return await self._with_short_flood_retry(
             lambda: self.inspect_channel(entity, matched_query=matched_query)
         )
+
+    async def _resolve_public_username(self, username: str):
+        """Resolve a public username, with a search fallback for Telethon quirks.
+
+        ``get_entity(username)`` normally uses ``contacts.resolveUsername``.
+        Some valid public channels occasionally return the misleading
+        ``No user has ... as username`` wrapper there (for example after a
+        username change or when the API cache is stale), while global search
+        still returns the channel.  Use the exact username from search before
+        telling the caller that the source is missing.
+        """
+        try:
+            return await self._with_short_flood_retry(
+                lambda: self._client.get_entity(username)
+            )
+        except ValueError as exc:
+            if not _is_missing_username_error(exc):
+                raise
+
+            result = await self._with_short_flood_retry(
+                lambda: self._client(
+                    functions.contacts.SearchRequest(
+                        q=username,
+                        limit=20,
+                        broadcasts=True,
+                    )
+                )
+            )
+            username_key = username.casefold()
+            for chat in getattr(result, "chats", ()):
+                if (
+                    isinstance(chat, types.Channel)
+                    and (getattr(chat, "username", None) or "").casefold()
+                    == username_key
+                ):
+                    return chat
+            raise exc
 
     async def inspect_channel(
         self,

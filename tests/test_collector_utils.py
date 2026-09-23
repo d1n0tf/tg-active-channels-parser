@@ -56,6 +56,9 @@ def test_discovery_reports_an_unoccupied_source_username_as_input_error() -> Non
         async def get_entity(self, username: str):
             raise ValueError(f'No user has "{username}" as username')
 
+        async def __call__(self, request):
+            return SimpleNamespace(chats=[])
+
     class MissingSourceCollector(TelegramChannelCollector):
         def __init__(self) -> None:
             self._settings = SimpleNamespace()
@@ -81,6 +84,44 @@ def test_discovery_reports_an_unoccupied_source_username_as_input_error() -> Non
                 candidate_limit=10,
                 gift_limit=0,
             )
+
+    asyncio.run(scenario())
+
+
+def test_discovery_uses_exact_search_result_when_username_resolution_is_stale() -> None:
+    channel = types.Channel(
+        id=123,
+        title="Source",
+        photo=types.ChatPhotoEmpty(),
+        date=None,
+        broadcast=True,
+        username="valid_source",
+    )
+
+    class Client:
+        async def get_entity(self, username: str):
+            raise ValueError(f'No user has "{username}" as username')
+
+        async def __call__(self, request):
+            return SimpleNamespace(chats=[channel])
+
+    class SearchFallbackCollector(TelegramChannelCollector):
+        def __init__(self) -> None:
+            self._settings = SimpleNamespace()
+            self._pool = _FakePool()  # type: ignore[assignment]
+            self._test_client = Client()
+
+        @property
+        def _client(self):
+            return self._test_client
+
+        async def _with_short_flood_retry(self, func, *args, **kwargs):
+            return await func(*args, **kwargs)
+
+    async def scenario() -> None:
+        collector = SearchFallbackCollector()
+        resolved = await collector._resolve_public_username("valid_source")
+        assert resolved is channel
 
     asyncio.run(scenario())
 
